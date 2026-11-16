@@ -8,9 +8,11 @@ here: wait, and proceed anyway once the budget runs out.
 
 A session's priority, in order:
   1. an explicit tag (``/gpu-prio low`` in the session, ``hermes gpu-prio set``)
-  2. a platform rule (``mode_by_platform``, e.g. every cron → ``ultralow``)
-  3. unattended session (cron, one-shot, detached worker) → ``unattended_mode``
-  4. the profile's ``default_mode``
+  2. a working-directory rule (``mode_by_cwd``, e.g. a background launcher's own
+     directory → ``ultralow``; the gateway cannot see the launcher's env markers)
+  3. a platform rule (``mode_by_platform``, e.g. every cron → ``ultralow``)
+  4. unattended session (cron, one-shot, detached worker) → ``unattended_mode``
+  5. the profile's ``default_mode``
 
 Settings: ``plugins.entries.gpu-gate.settings.*`` (see README.md).
 """
@@ -62,11 +64,11 @@ def _as_tuple(value: Any, default: tuple) -> tuple:
     return default
 
 
-def _as_platform_map(value: Any, default: tuple = ()) -> tuple:
+def _as_platform_map(value: Any, default: tuple = (), lower: bool = True) -> tuple:
     """`{cron: ultralow}` (YAML) or `cron=ultralow,telegram=low` → tuple of pairs.
 
     Entries whose mode is unknown are dropped silently: a bad setting must not
-    make the plugin fail to load.
+    make the plugin fail to load. `lower=False` keeps the key verbatim (paths).
     """
     if value is None:
         return tuple(default)
@@ -87,7 +89,7 @@ def _as_platform_map(value: Any, default: tuple = ()) -> tuple:
                 items.append((key, mode))
     out = []
     for key, mode in items:
-        plat, mode = str(key).strip().lower(), str(mode).strip().lower()
+        plat, mode = (str(key).strip().lower() if lower else str(key).strip()), str(mode).strip().lower()
         if plat and mode in gate.MODES:
             out.append((plat, mode))
     return tuple(out)
@@ -126,6 +128,7 @@ class Settings:
             default_mode=mode if mode in gate.MODES else gate.NORMAL,
             unattended_mode=unattended if unattended in gate.MODES else gate.LOW,
             mode_by_platform=_as_platform_map(g("mode_by_platform", None)),
+            mode_by_cwd=_as_platform_map(g("mode_by_cwd", None), lower=False),
             auto_low_platforms=_as_tuple(g("auto_low_platforms", ()), ()),
             tag_ttl_days=_as_float(g("tag_ttl_days", 7.0), 7.0),
             journal_max_bytes=_as_float(g("journal_max_bytes", 1_000_000.0), 1_000_000.0),
@@ -134,31 +137,78 @@ class Settings:
 
 # --------------------------------------------------------------------- priority
 
-def unattended(ctx: Any) -> bool:
-    """Unattended session? (cron, `chat -q`, detached worker)"""
-    if any(os.environ.get(name) for name in _UNATTENDED_ENVS):
-        return True
+def finite_turn() -> bool:
+    """Is the turn being served right now a finite one (`chat -q --oneshot`, `-z`)?
+
+    A session spawned by a launcher is served by the **running gateway**, so the
+    launcher's own environment (`HERMES_SINGLE_QUERY_SESSION`) never reaches this
+    process. Hermes carries the one-shot fact on the admission instead, in a
+    turn-scoped context var: that is the only marker a gateway-side gate can see.
+    `None` is the standalone-CLI case (no admission) — the env markers cover it.
+    """
     try:
-        return ctx.current_cron_execution() is not None
-    except Exception:  # noqa: BLE001 - outside a turn the cron context may be absent
+        from gateway.session_finite import finite_turn_required
+        return finite_turn_required() is True
+    except Exception:  # noqa: BLE001 - no gateway package here, or outside a turn
         return False
 
 
+def unattended_reason(ctx: Any) -> str:
+    """Why this turn is unattended — `""` when somebody is watching it.
+
+    Kept as a string because it lands in the decision journal: « why is this
+    session gated / why is it not » is the question the journal answers.
+    """
+    if any(os.environ.get(name) for name in _UNATTENDED_ENVS):
+        return "env"
+    if finite_turn():
+        return "finite"
+    try:
+        if ctx.current_cron_execution() is not None:
+            return "cron"
+    except Exception:  # noqa: BLE001 - outside a turn the cron context may be absent
+        pass
+    return ""
+
+
+def unattended(ctx: Any) -> bool:
+    """Unattended session? (cron, `chat -q`, detached worker)"""
+    return bool(unattended_reason(ctx))
+
+
+def session_cwd() -> str:
+    """Working directory of the session whose turn is running, `""` if unknown.
+
+    In a gateway process the process cwd is the install root and shared by every
+    session, so the per-session value must come from the turn context.
+    """
+    try:
+        from hermes_cli.plugin_session import session_cwd as _cwd
+        return str(_cwd() or "")
+    except Exception:  # noqa: BLE001 - outside a turn, or older Hermes
+        return ""
+
+
 def resolve_mode(ctx: Any, state: Any, session_id: str, platform: Any,
-                 policy: gate.Policy) -> tuple[str, str]:
+                 policy: gate.Policy, cwd: str = "") -> tuple[str, str]:
     """→ (mode, where the choice came from) — an explicit tag always wins.
 
-    Order: hand-set tag → platform rule (e.g. every cron in `ultralow`) →
-    "unattended" rule → default mode.
+    Order: hand-set tag → working-directory rule (a background launcher's own
+    directory) → platform rule (e.g. every cron in `ultralow`) → "unattended"
+    rule (cron, gateway one-shot) → default mode.
     """
     tagged = gate.read_tag(state, session_id, policy.tag_ttl_days)
     if tagged:
         return tagged, "tag"
+    by_cwd = gate.cwd_mode(policy, cwd)
+    if by_cwd:
+        return by_cwd, "auto:cwd:%s" % cwd
     by_platform = gate.platform_mode(policy, platform)
     if by_platform:
         return by_platform, "auto:platform:%s" % str(platform or "")
-    if unattended(ctx):
-        return policy.unattended_mode, "auto:unattended"
+    reason = unattended_reason(ctx)
+    if reason:
+        return policy.unattended_mode, "auto:unattended:%s" % reason
     return policy.default_mode, "default"
 
 
@@ -176,7 +226,8 @@ def make_middleware(ctx: Any, settings: Settings, cache: gate.VerdictCache,
         policy = settings.get()
         if not policy.enabled or not gate.targets_engine(base_url, policy.engine_prefixes):
             return next_call(request)
-        mode, origin = resolve_mode(ctx, state, session_id, platform, policy)
+        mode, origin = resolve_mode(ctx, state, session_id, platform, policy,
+                                    cwd=session_cwd() if policy.mode_by_cwd else "")
         if mode == gate.NORMAL:
             return next_call(request)
         entry = int(api_call_count or 1) <= 1

@@ -158,7 +158,7 @@ check("explicit tag wins", plugin.resolve_mode(ctx, ctx.state, "s1", "cli", poli
       (gate.ULTRALOW, "tag"))
 gate.drop_tag(ctx.state, "s1")
 check("cron auto = low", plugin.resolve_mode(FakeCtx(cron=True), ctx.state, "s2", "cli", policy),
-      (gate.LOW, "auto:unattended"))
+      (gate.LOW, "auto:unattended:cron"))
 check("no rule, attended cron platform = normal",
       plugin.resolve_mode(FakeCtx(), ctx.state, "s3", "cron", policy),
       ("normal", "default"))
@@ -189,6 +189,33 @@ check("mode_by_platform: cron=ultralow form",
 check("mode_by_platform: unknown mode dropped",
       plugin._as_platform_map({"cron": "hyperlow", "sms": "low"}), (("sms", gate.LOW),))
 check("mode_by_platform: absent = empty", plugin._as_platform_map(None), ())
+
+print("\nunattended: gateway one-shot admission (the auto-created MAIL threads)")
+# A launcher's `chat -q --oneshot` turn is served by the RUNNING gateway: the
+# launcher's env never reaches it, only the admission's finite flag does, in a
+# turn-scoped context var. Fake that module to prove the gate reads it.
+import types  # noqa: E402
+_saved = {n: sys.modules.get(n) for n in ("gateway", "gateway.session_finite")}
+_fake_pkg, _fake_mod = types.ModuleType("gateway"), types.ModuleType("gateway.session_finite")
+_finite = {"v": None}
+_fake_mod.finite_turn_required = lambda: _finite["v"]
+_fake_pkg.session_finite = _fake_mod
+sys.modules["gateway"], sys.modules["gateway.session_finite"] = _fake_pkg, _fake_mod
+_finite["v"] = True
+check("finite admission = unattended", plugin.unattended_reason(FakeCtx()), "finite")
+check("finite admission gets unattended_mode",
+      plugin.resolve_mode(FakeCtx(), ctx.state, "s6", "cli",
+                          gate.Policy(unattended_mode=gate.ULTRALOW)),
+      (gate.ULTRALOW, "auto:unattended:finite"))
+_finite["v"] = False
+check("attended turn on that same session stays free", plugin.unattended_reason(FakeCtx()), "")
+_finite["v"] = None
+check("None = standalone CLI, no gateway admission", plugin.unattended_reason(FakeCtx()), "")
+for _name, _mod in _saved.items():
+    if _mod is None:
+        sys.modules.pop(_name, None)
+    else:
+        sys.modules[_name] = _mod
 
 print("\nsettings: defaults and overrides")
 loaded = plugin.Settings(FakeCtx()).get()

@@ -57,6 +57,12 @@ class Policy:
     #: that makes every cron `ultralow` without tagging them one by one
     #: (`{cron: ultralow}`); a cron session reports platform `cron`.
     mode_by_platform: tuple = ()
+    #: working-directory prefix → mode, e.g. `{"/srv/ia-queue": "ultralow"}`.
+    #: A background launcher (idle-slot worker) runs its sessions in a dedicated
+    #: directory, which is the one thing the gateway can still see about a
+    #: one-shot: `os.environ` markers of the launching process are invisible to
+    #: the gateway that serves the turn. Longest matching prefix wins.
+    mode_by_cwd: tuple = ()
     #: legacy alias of `mode_by_platform`; platforms listed here become `low`.
     auto_low_platforms: tuple = ()
     tag_ttl_days: float = 7.0
@@ -214,6 +220,24 @@ def platform_mode(policy: Policy, platform: Any) -> Optional[str]:
     if key in policy.auto_low_platforms:
         return LOW
     return None
+
+
+def cwd_mode(policy: Policy, cwd: Any) -> Optional[str]:
+    """Mode forced by the session's working directory, `None` if no rule matches.
+
+    Matched on path prefixes (the session cwd must be the rule itself or below
+    it), longest rule wins, so a broad `"/srv"` can coexist with `"/srv/queue"`.
+    """
+    path = str(cwd or "").strip()
+    if not path:
+        return None
+    best_len, best_mode = -1, None
+    for prefix, mode in policy.mode_by_cwd:
+        cut = prefix.rstrip("/")
+        if path == cut or path.startswith(cut + "/"):
+            if len(cut) > best_len:
+                best_len, best_mode = len(cut), mode
+    return best_mode
 
 
 # ---------------------------------------------------------------- journal

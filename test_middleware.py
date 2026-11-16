@@ -240,7 +240,7 @@ slash("auto", session_id="s9")
 check("/gpu-prio auto removes", gate.read_tag(ctx.state, "s9", 7.0), None)
 check("/gpu-prio with no argument = help", "gpu-prio" in slash("", session_id="s9"), True)
 
-setup, run = plugin.make_cli(ctx.state, plugin.Settings(ctx))
+setup, run = plugin.make_cli(ctx, ctx.state, plugin.Settings(ctx))
 import argparse  # noqa: E402
 parser = argparse.ArgumentParser()
 sub = parser.add_subparsers()
@@ -250,6 +250,11 @@ run(cli_parser.parse_args(["set", "sess-7", "ultralow"]))
 check("CLI set", gate.read_tag(ctx.state, "sess-7", 7.0), gate.ULTRALOW)
 run(cli_parser.parse_args(["rm", "sess-7"]))
 check("CLI rm", gate.read_tag(ctx.state, "sess-7", 7.0), None)
+import io, contextlib  # noqa: E402
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    run(cli_parser.parse_args(["status"]))
+check("CLI status names the untagged default", "untagged session:" in _out.getvalue(), True)
 
 print("\ndecision journal")
 jdir = tempfile.mkdtemp(prefix="gpu-gate-journal-")

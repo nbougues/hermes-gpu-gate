@@ -339,7 +339,7 @@ def _usage(session_id: str, ctx: Any, state: Any, policy: gate.Policy) -> str:
             % (mode, origin, policy.idle_min_s, policy.url))
 
 
-def make_cli(state: Any, settings: Settings):
+def make_cli(ctx: Any, state: Any, settings: Settings):
     """`hermes gpu-prio` — view and set tags from outside a session."""
 
     def setup(sub: Any) -> None:
@@ -393,6 +393,13 @@ def make_cli(state: Any, settings: Settings):
             if policy.mode_by_platform:
                 print("platform rules: %s" % ", ".join(
                     "%s=%s" % pair for pair in policy.mode_by_platform))
+            if policy.mode_by_cwd:
+                print("cwd rules: %s" % ", ".join(
+                    "%s=%s" % pair for pair in policy.mode_by_cwd))
+            # what an untagged session in each situation would actually get
+            print("untagged session: %s (%s), unattended: %s"
+                  % (resolve_mode(ctx, state, "", "", policy)[0], policy.default_mode,
+                     policy.unattended_mode))
             return
         if not session:
             print("a session identifier is required (`hermes gpu-prio ls`)")
@@ -423,7 +430,7 @@ def register(ctx: Any) -> None:
     ctx.register_command("gpu-prio", handler=make_slash(ctx, settings, cache, state),
                          description="GPU gate: low / ultralow priority for this session.",
                          args_hint="[low|ultralow|normal|auto|status|log]")
-    setup_fn, handler_fn = make_cli(state, settings)
+    setup_fn, handler_fn = make_cli(ctx, state, settings)
     ctx.register_cli_command("gpu-prio", help=_HELP, description=_HELP,
                              setup_fn=setup_fn, handler_fn=handler_fn)
 

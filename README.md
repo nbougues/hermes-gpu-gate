@@ -101,7 +101,7 @@ serving without the gate until it restarts.
 Verify:
 
 ```bash
-hermes gpu-prio status            # verdict, budgets, platform rules
+hermes gpu-prio status            # verdict, budgets, rules, untagged default
 hermes gpu-prio ls                # tags in place
 hermes gpu-prio log               # recent decisions
 hermes logs | grep gpu-gate       # gate activity
@@ -232,9 +232,10 @@ message, tool calls and results are already in the transcript, so re-sending the
 prompt would ask for the same work twice. The nudge says to pick up where it
 stopped and not redo completed steps.
 
-State lives next to the decision journal: `restarts.json` (the attempt ledger) and
-`restarts.jsonl` (one line per restart). The database is opened read-only.
-`--dry-run` prints what would be restarted, `--help` lists every knob.
+Its own state lives under the profile home, in `plugin-data/gpu-gate/`:
+`restarts.json` (the attempt ledger), `restarts.jsonl` (one line per restart) and
+`recover.lock`. The state database is only ever opened read-only. `--dry-run`
+prints what would be restarted, `--help` lists every knob.
 
 ## Decision journal
 
@@ -270,7 +271,7 @@ its tail.
 
 ```bash
 python3 test_gate.py         # 32 assertions: pure core logic
-python3 test_middleware.py   # 54 assertions: Hermes glue, fake verdict service on a local socket
+python3 test_middleware.py   # 59 assertions: Hermes glue, fake verdict service on a local socket
 python3 test_recover.py      # 34 assertions: interrupted-turn recovery on a throwaway state.db
 ```
 

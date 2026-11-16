@@ -1,5 +1,5 @@
 name: gpu-gate
-version: 1.0.0
+version: 1.1.0
 description: "Only runs a low-priority session when the inference server is actually free (ia-free /free verdict): low = at most 1 request in flight, ultralow = engine quiet for N seconds at turn entry. Bounded wait, then it proceeds anyway."
 author: "Nicolas BOUGUES"
 license: MIT

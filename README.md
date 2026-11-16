@@ -123,12 +123,27 @@ First rule that answers wins:
 
 1. **explicit tag** — `/gpu-prio low` in the session, or
    `hermes gpu-prio set <session> ultralow` from outside;
-2. **`mode_by_platform`** — a per-platform rule. This is what puts **every cron**
+2. **`mode_by_cwd`** — a working-directory prefix rule, longest prefix wins. A
+   background launcher runs its sessions in a dedicated directory, which is the
+   one thing the gateway can still see about a one-shot (its `os.environ` markers
+   are invisible to the process that serves the turn);
+3. **`mode_by_platform`** — a per-platform rule. This is what puts **every cron**
    in `ultralow`, existing and future, without tagging anything one by one (a
    cron session reports `platform="cron"`);
-3. **unattended session** (`HERMES_SINGLE_QUERY_SESSION`, `HERMES_CRON_SESSION`,
-   a running cron execution) → `unattended_mode` (`low` by default);
-4. **`default_mode`** of the profile (`normal` by default).
+4. **unattended session** → `unattended_mode` (`low` by default). Three markers,
+   any one is enough: the launcher env (`HERMES_SINGLE_QUERY_SESSION`,
+   `HERMES_CRON_SESSION`), a running cron execution, or — the one that matters
+   under a gateway — the **finite admission flag** of the turn
+   (`gateway.session_finite.finite_turn_required()`). A session spawned by a
+   script (`hermes chat -q --oneshot`) is served by the *running gateway*, which
+   never sees the launcher's environment; the admission does carry the one-shot
+   fact, so a scripted turn is gated while a person answering in that same
+   session later is not. The journal records which marker fired
+   (`auto:unattended:env|cron|finite`).
+5. **`default_mode`** of the profile (`normal` by default). Setting it to `low`
+   makes **every untagged session** — including the interactive one you are typing
+   in — wait for a free slot; a session that must never wait gets an explicit
+   `/gpu-prio normal` tag or a `mode_by_platform` / `mode_by_cwd` exception.
 
 ```yaml
 # config.yaml — every cron in ultralow, everything else untouched
@@ -164,6 +179,7 @@ Under `plugins.entries.gpu-gate.settings` in the profile's `config.yaml`:
 | `verdict_timeout_s` / `verdict_cache_s` | `2` / `2` | HTTP timeout, lifetime of the verdict shared between sessions |
 | `default_mode` / `unattended_mode` | `normal` / `low` | default modes |
 | `mode_by_platform` | *(empty)* | platform → mode, e.g. `{cron: ultralow}`; takes precedence over `unattended_mode` |
+| `mode_by_cwd` | *(empty)* | path prefix → mode, e.g. `{"/srv/ia-queue": "ultralow"}`; wins over `mode_by_platform` |
 | `auto_low_platforms` | *(empty)* | legacy alias of `mode_by_platform` that maps those platforms to `low` |
 | `tag_ttl_days` | `7` | tag lifetime |
 | `journal_max_bytes` | `1000000` | decision journal ceiling before rotation; `0` turns it off |
@@ -172,6 +188,53 @@ Under `plugins.entries.gpu-gate.settings` in the profile's `config.yaml`:
 ends: gateway inactivity `agent.gateway_timeout` (1800 s by default), cron
 inactivity (600 s), and any external launcher's `max_task_minutes` — that time is
 **shared** between waiting and working.
+
+## Recovering interrupted turns
+
+A gated session spends most of its life *inside* the middleware, waiting. From the
+turn loop's point of view an API call has been in flight the whole time, so
+anything that tears the session down while it waits — a desktop or backend
+shutdown, a `/stop`, a message typed into a session that is already busy — ends
+the turn with a sentinel instead of an answer:
+
+```
+Operation interrupted: waiting for model response (726.6s elapsed).
+```
+
+The user message is then sitting there unanswered and nothing retries it.
+`recover_interrupted.py` is a standalone cron that finds those sessions and
+re-submits a short continuation nudge (`--resume`, same session id, same model,
+same cwd), so the turn picks up where it stopped instead of waiting for you:
+
+```cron
+*/10 * * * * /usr/bin/python3 ~/.hermes/plugins/gpu-gate/recover_interrupted.py \
+    --verdict-url http://192.0.2.10:8765/free \
+    >> ~/.hermes/logs/gpu-gate-recover.log 2>&1
+
+# another profile: prefix the line with HERMES_HOME=~/.hermes/profiles/<name>
+```
+
+What it will and will not touch:
+
+| Guard | Why |
+|---|---|
+| the **last active message** must be the sentinel | a session answered afterwards is healthy |
+| no unexpired row in `session_turn_leases` | somebody is working on it right now |
+| `--min-age-s` (180 s) | a sentinel that just landed may still be finishing |
+| `--max-age-s` (6 h) | no resurrecting week-old dead sessions |
+| `--max` (2) restarts per run | recovery must not become the load spike it recovers from |
+| the verdict must say `free` | refuses to add load when the engine is busy **or unreadable** (`--no-require-free` to override) |
+| `--max-attempts` (2) per session | a session that keeps dying is left alone, not restarted forever |
+| `recover.lock` | one recovery at a time, even if a resumed turn outlives the tick |
+
+It re-submits a **nudge**, not the original prompt: the interrupted turn's user
+message, tool calls and results are already in the transcript, so re-sending the
+prompt would ask for the same work twice. The nudge says to pick up where it
+stopped and not redo completed steps.
+
+State lives next to the decision journal: `restarts.json` (the attempt ledger) and
+`restarts.jsonl` (one line per restart). The database is opened read-only.
+`--dry-run` prints what would be restarted, `--help` lists every knob.
 
 ## Decision journal
 
@@ -208,14 +271,17 @@ its tail.
 ```bash
 python3 test_gate.py         # 32 assertions: pure core logic
 python3 test_middleware.py   # 54 assertions: Hermes glue, fake verdict service on a local socket
+python3 test_recover.py      # 34 assertions: interrupted-turn recovery on a throwaway state.db
 ```
 
 Fully offline, no network, no GPU: the `admit()` matrix (three modes, turn entry
 vs iteration, unreachable gate, unreachable engine), the wait loop on a fake
 clock (slot after N slices, budget exhausted, exploding probe), `base_url`
 filtering, tag lifecycle (TTL, per-session isolation, removal), priority
-resolution (tag > platform > unattended > default), settings parsing, and the
-journal round-trip and rotation.
+resolution (tag > cwd > platform > unattended > default), settings parsing, the
+journal round-trip and rotation, and — for the recovery cron — candidate
+selection (answered / archived / leased / too young / too old), the per-run cap,
+the per-session attempt breaker and the verdict throttle.
 
 ## Assumed limits
 

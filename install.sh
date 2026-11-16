@@ -29,6 +29,7 @@ DEST="$HOME_DIR/plugins/gpu-gate"
 echo "== copying into $DEST"
 mkdir -p "$DEST"
 install -m 0644 "$HERE/plugin.yaml" "$HERE/__init__.py" "$HERE/gate.py" "$DEST/"
+install -m 0755 "$HERE/recover_interrupted.py" "$DEST/"
 
 echo "== validating the manifest"
 "$HERMES_BIN" plugins validate "$DEST" >/dev/null && echo "  manifest OK"
@@ -47,9 +48,15 @@ Next steps:
   3. in a session: /gpu-prio low   or   /gpu-prio ultralow
   4. settings  : plugins.entries.gpu-gate.settings.{verdict_url,engine_prefixes,
                  idle_min_s,max_wait_s,max_wait_unattended_s,default_mode,
-                 unattended_mode,mode_by_platform}
-                 (see README.md — a restart is needed after a change)
+                 unattended_mode,mode_by_platform,mode_by_cwd}
+                 (see README.md — a restart is needed after a code change,
+                 nothing is needed for a settings change)
+  5. optional  : the interrupted-turn recovery cron (see README.md):
+                 */10 * * * * /usr/bin/python3 $DEST/recover_interrupted.py \
+                     --verdict-url <your verdict_url> \
+                     >> $HOME_DIR/logs/gpu-gate-recover.log 2>&1
 
-By default an unattended session (cron, 'chat -q', detached worker) is already
-treated as "low" without any configuration; an interactive session stays "normal".
+An unattended session (cron, 'chat -q', detached worker) is treated as
+"unattended_mode" ("low" unless configured); an interactive session gets
+"default_mode" ("normal" unless configured).
 EOF

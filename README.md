@@ -272,7 +272,7 @@ its tail.
 ```bash
 python3 test_gate.py         # 32 assertions: pure core logic
 python3 test_middleware.py   # 59 assertions: Hermes glue, fake verdict service on a local socket
-python3 test_recover.py      # 34 assertions: interrupted-turn recovery on a throwaway state.db
+python3 test_recover.py      # 38 assertions: interrupted-turn recovery on a throwaway state.db
 ```
 
 Fully offline, no network, no GPU: the `admit()` matrix (three modes, turn entry

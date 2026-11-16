@@ -42,6 +42,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -257,13 +258,31 @@ def verdict_gate(opts: Options) -> tuple[bool, str]:
 
 # --------------------------------------------------------------------- restart
 
+def resolve_hermes(value: str) -> str:
+    """Absolute path to the `hermes` launcher, `""` when it cannot be found.
+
+    cron runs with a minimal PATH, so a bare `hermes` — which every interactive
+    shell resolves without thinking — is simply not there. Fall back to the two
+    places Hermes installs itself.
+    """
+    if os.sep in value:
+        return value if os.path.isfile(value) and os.access(value, os.X_OK) else ""
+    extra = os.pathsep.join((str(Path.home() / ".local" / "bin"),
+                             str(Path.home() / ".hermes" / "bin")))
+    return shutil.which(value) or shutil.which(value, path=extra) or ""
+
+
 def restart_session(opts: Options, cand: Candidate) -> tuple[bool, str]:
     """Re-submit the continuation nudge into the session. → (ok, detail).
 
     ``--resume`` keeps the session id, its model/provider and its recorded cwd,
     so the resumed turn lands in the same transcript the user was reading.
     """
-    cmd = [opts.hermes_bin, "chat", "--resume", cand.session_id,
+    exe = resolve_hermes(opts.hermes_bin)
+    if not exe:
+        return False, ("cannot find the hermes launcher (%r) — pass --hermes-bin"
+                       % opts.hermes_bin)
+    cmd = [exe, "chat", "--resume", cand.session_id,
            "--oneshot", "-Q", "--query-file", "-"]
     env = dict(os.environ, HERMES_HOME=str(opts.home))
     cwd = cand.cwd if cand.cwd and os.path.isdir(cand.cwd) else str(opts.home)

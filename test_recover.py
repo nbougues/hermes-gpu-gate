@@ -144,6 +144,16 @@ down = rec.verdict_gate(opts(home, require_free=True,
 check("unreachable verdict blocks the run", down[0], False)
 check("unreachable verdict explains itself", down[1].startswith("verdict unreachable"), True)
 
+# ------------------------------------------------- hermes launcher resolution
+
+print("hermes launcher resolution")
+check("existing absolute path is kept", rec.resolve_hermes(sys.executable), sys.executable)
+check("missing absolute path is rejected", rec.resolve_hermes("/no/such/hermes"), "")
+check("unknown bare name is rejected", rec.resolve_hermes("definitely-not-a-binary"), "")
+_resolved = rec.resolve_hermes("hermes")
+check("bare name gives an existing file or nothing",
+      _resolved == "" or os.path.isfile(_resolved), True)
+
 # --------------------------------------------------------------- run() wiring
 
 print("run() wiring")

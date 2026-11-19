@@ -24,7 +24,7 @@ import os
 import time
 from typing import Any, Callable, Optional
 
-from . import gate
+from . import gate, pause, perf
 
 logger = logging.getLogger("plugins.gpu_gate")
 
@@ -132,6 +132,19 @@ class Settings:
             auto_low_platforms=_as_tuple(g("auto_low_platforms", ()), ()),
             tag_ttl_days=_as_float(g("tag_ttl_days", 7.0), 7.0),
             journal_max_bytes=_as_float(g("journal_max_bytes", 1_000_000.0), 1_000_000.0),
+            pause_max_wait_s=_as_float(g("pause_max_wait_s", 300.0), 300.0),
+            indefinite_max_s=_as_float(g("indefinite_max_s", 21600.0), 21600.0),
+            perf_enabled=_as_bool(g("perf_enabled", True), True),
+            perf_max_bytes=_as_float(g("perf_max_bytes", 2_000_000.0), 2_000_000.0),
+            perf_min_output_tokens=int(_as_float(g("perf_min_output_tokens", 64), 64)),
+            perf_min_prompt_tokens=int(_as_float(g("perf_min_prompt_tokens", 2000), 2000)),
+            perf_decode_tps_min=_as_float(g("perf_decode_tps_min", 12.0), 12.0),
+            perf_cache_ratio_min=_as_float(g("perf_cache_ratio_min", 0.25), 0.25),
+            perf_consecutive=int(_as_float(g("perf_consecutive", 3), 3)),
+            auto_pause_enabled=_as_bool(g("auto_pause_enabled", False), False),
+            auto_pause_min_s=_as_float(g("auto_pause_min_s", 20.0), 20.0),
+            auto_pause_max_s=_as_float(g("auto_pause_max_s", 90.0), 90.0),
+            auto_pause_per_hour=int(_as_float(g("auto_pause_per_hour", 6), 6)),
         )
 
 
@@ -224,13 +237,33 @@ def make_middleware(ctx: Any, settings: Settings, cache: gate.VerdictCache,
         if next_call is None:
             return None
         policy = settings.get()
-        if not policy.enabled or not gate.targets_engine(base_url, policy.engine_prefixes):
-            return next_call(request)
-        mode, origin = resolve_mode(ctx, state, session_id, platform, policy,
-                                    cwd=session_cwd() if policy.mode_by_cwd else "")
-        if mode == gate.NORMAL:
+        if not policy.enabled:
             return next_call(request)
         entry = int(api_call_count or 1) <= 1
+        mode, origin = resolve_mode(ctx, state, session_id, platform, policy,
+                                    cwd=session_cwd() if policy.mode_by_cwd else "")
+        # A pause is not a verdict about the engine: it holds the session whatever
+        # model it is talking to, so it is checked before the engine filter and
+        # before the `normal` shortcut. Re-read every slice, so `/gpu-prio resume`
+        # releases a waiting turn at once instead of at its next iteration.
+        held, record = pause.check(state, session_id, mode)
+        if held:
+            waited, why = _hold(state, session_id, mode, record, policy)
+            logger.info("gpu-gate PAUSE session=%s scope=%s entry=%s waited=%.0fs %s",
+                        session_id or "?", record.get("scope", "?"), entry, waited, why)
+            gate.journal_write(getattr(state, "data_dir", None), {
+                "ts": round(time.time(), 3), "session": session_id or "?",
+                "platform": str(platform or ""), "mode": mode, "origin": origin,
+                "entry": entry, "iter": int(api_call_count or 1),
+                "waited_s": round(waited, 1), "budget_s": round(_hold_budget(record, policy), 0),
+                "outcome": "pause:" + why, "model": str(model or ""),
+                "engine": str(base_url or ""), "pause": pause.describe(record),
+                "pid": os.getpid(),
+            }, policy.journal_max_bytes)
+        if not gate.targets_engine(base_url, policy.engine_prefixes):
+            return next_call(request)
+        if mode == gate.NORMAL:
+            return next_call(request)
         budget = policy.max_wait_unattended_s if unattended(ctx) else policy.max_wait_s
         # First probe goes through the shared cache (parallel sessions don't hammer
         # the service); later ones probe live — that is the wait loop.
@@ -238,8 +271,10 @@ def make_middleware(ctx: Any, settings: Settings, cache: gate.VerdictCache,
 
         def probe() -> dict:
             probes["n"] += 1
-            probes["last"] = cache.get(force=probes["n"] > 1)
-            return probes["last"]
+            verdict = cache.get(force=probes["n"] > 1)
+            probes["last"] = verdict
+            perf.note_engine(session_id, verdict)
+            return verdict
 
         waited, why = gate.wait_for_slot(probe, mode, entry, policy, budget)
         if waited >= policy.slice_s:
@@ -272,6 +307,29 @@ def make_middleware(ctx: Any, settings: Settings, cache: gate.VerdictCache,
     return gpu_gate
 
 
+def _hold_budget(record: dict, policy: gate.Policy) -> float:
+    """How long this turn may sit in a pause: its own remaining time if it is timed
+    (plus one slice so the loop notices the deadline itself), never over the cap."""
+    left = pause.remaining(record)
+    if left is None:
+        return policy.pause_max_wait_s
+    return min(left + policy.slice_s, policy.pause_max_wait_s)
+
+
+def _hold(state: Any, session_id: str, mode: str, record: dict,
+          policy: gate.Policy) -> tuple[float, str]:
+    """Wait out a pause, re-reading the state each slice so a manual resume lands
+    immediately. Bounded: past `_hold_budget` we proceed and say `pause_overrun`."""
+    def hold() -> Optional[str]:
+        still, fresh = pause.check(state, session_id, mode)
+        if not still:
+            return None
+        left = pause.remaining(fresh)
+        return "indefinite" if left is None else "%.0fs left" % left
+
+    return gate.wait_while(hold, _hold_budget(record, policy), policy.slice_s)
+
+
 def _brief_verdict(v: dict) -> dict:
     """Just enough to re-read a decision afterwards."""
     if not v:
@@ -283,14 +341,196 @@ def _brief_verdict(v: dict) -> dict:
             "inflight": (v.get("signals") or {}).get("inflight")}
 
 
+# --------------------------------------------------------------- perf + autopause
+
+def make_perf_hook(settings: Settings, state: Any,
+                   tracker: perf.SlowTracker) -> Callable[..., Any]:
+    """`post_api_request`: one sample per provider call, and the auto-pause that may follow.
+
+    Observational by default. The auto-pause is armed by `auto_pause_enabled`, and it
+    is deliberately off until the journal has shown what a normal decode rate and cache
+    ratio look like on this engine: a threshold picked before the data pauses either
+    nothing or the wrong session.
+    """
+
+    def gpu_perf(session_id: str = "", platform: str = "", model: str = "",
+                 provider: str = "", base_url: str = "", api_call_count: Any = 0,
+                 api_duration: Any = None, started_at: Any = None,
+                 first_chunk_at: Any = None, usage: Any = None,
+                 finish_reason: str = "", **_kw: Any) -> None:
+        policy = settings.get()
+        if not policy.perf_enabled:
+            return None
+        tracker.configure(policy.perf_decode_tps_min, policy.perf_cache_ratio_min,
+                          policy.perf_min_output_tokens, policy.perf_min_prompt_tokens,
+                          policy.perf_consecutive, policy.auto_pause_per_hour)
+        row = perf.sample({
+            "session_id": session_id, "platform": platform, "model": model,
+            "provider": provider, "base_url": base_url, "api_call_count": api_call_count,
+            "api_duration": api_duration, "started_at": started_at,
+            "first_chunk_at": first_chunk_at, "usage": usage,
+            "finish_reason": finish_reason,
+        })
+        if row is None:
+            return None
+        row["engine"] = perf.engine_note(session_id)
+        data_dir = getattr(state, "data_dir", None)
+        gate.journal_write(data_dir, row, policy.perf_max_bytes, name=perf.JOURNAL_NAME)
+        decision = tracker.observe(row)
+        if not decision:
+            return None
+        detail = "%s: %.1f t/s, cache %s, %s tokens out in %.1fs" % (
+            decision["reason"], float(row.get("decode_tps") or 0),
+            row.get("cache_ratio"), row.get("output_tokens"), row.get("duration_s"))
+        if decision["kind"] == "throttled":
+            logger.warning("gpu-gate perf session=%s %s — already paused %s× this hour, "
+                           "not escalating", session_id or "?", detail,
+                           policy.auto_pause_per_hour)
+            gate.journal_write(data_dir, {"ts": row["ts"], "kind": "auto_pause_throttled",
+                                          "session": session_id, "detail": detail},
+                               policy.journal_max_bytes, name=perf.JOURNAL_NAME)
+            return None
+        if not policy.auto_pause_enabled:
+            logger.info("gpu-gate perf session=%s %s — %s slow calls in a row "
+                        "(auto-pause is disarmed)", session_id or "?", detail,
+                        decision["streak"])
+            gate.journal_write(data_dir, {"ts": row["ts"], "kind": "slow_streak",
+                                          "session": session_id, "detail": detail,
+                                          "streak": decision["streak"],
+                                          "auto_pause": "off"}, policy.journal_max_bytes,
+                               name=perf.JOURNAL_NAME)
+            return None
+        seconds = pause.jitter_seconds(policy.auto_pause_min_s, policy.auto_pause_max_s)
+        record = pause.write(state, pause.scope_of_session(session_id),
+                             time.time() + seconds,
+                             reason="auto %s (%s)" % (decision["reason"], detail),
+                             source="auto:%s" % decision["reason"],
+                             indefinite_max_s=policy.indefinite_max_s)
+        logger.warning("gpu-gate AUTO-PAUSE session=%s %.0fs — %s (streak %s)",
+                       session_id or "?", seconds, detail, decision["streak"])
+        gate.journal_write(data_dir, {"ts": row["ts"], "kind": "auto_pause",
+                                      "session": session_id, "detail": detail,
+                                      "streak": decision["streak"],
+                                      "pause_s": round(seconds, 1)}, policy.journal_max_bytes,
+                           name=perf.JOURNAL_NAME)
+
+    return gpu_perf
+
+
+def make_pause_gate(ctx: Any, settings: Settings, state: Any) -> Callable[..., Any]:
+    """`pre_llm_call`: an **indefinite** pause refuses the turn before any inference.
+
+    Only indefinite pauses are handled here. A timed pause is waited out inside the
+    turn by the middleware, which is what "pause for 30 s" should mean; refusing the
+    turn instead would throw away the user's message for a wait we could simply sit
+    through. A refusal is a drop, not a hold: Hermes withholds the vetoed turn and
+    never replays it, so the message has to say exactly that.
+    """
+
+    def gpu_pause_entry(session_id: str = "", platform: Any = "", **_kw: Any) -> Optional[dict]:
+        policy = settings.get()
+        if not policy.enabled:
+            return None
+        mode, _origin = resolve_mode(ctx, state, session_id, platform, policy)
+        held, record = pause.check(state, session_id, mode)
+        if not held or pause.remaining(record) is not None:
+            return None
+        logger.info("gpu-gate REFUSED turn session=%s %s", session_id or "?",
+                    pause.describe(record))
+        gate.journal_write(getattr(state, "data_dir", None), {
+            "ts": round(time.time(), 3), "kind": "paused_turn", "session": session_id or "?",
+            "platform": str(platform or ""), "mode": mode, "outcome": "refused",
+            "pause": pause.describe(record)}, policy.journal_max_bytes)
+        return {"action": "block", "message": (
+            "**gpu-gate: this session is on pause** (%s).\n\n"
+            "Your message was **not** run and will not be replayed — send it again after "
+            "`/gpu-prio resume`, or wait for the pause to expire."
+            % pause.describe(record))}
+
+    return gpu_pause_entry
+
+
 # -------------------------------------------------------------------- commands
 
+#: a scope word in `pause`/`resume` means something other than the current session
+_SCOPES = ("all",) + gate.MODES
+
+
+def parse_pause_args(rest: str, session_id: str) -> tuple[str, str, str]:
+    """`[all|low|ultralow] [30m|until 15:00|indef] [reason…]` → (scope, duration, reason).
+
+    A bare mode word is a scope here (`pause ultralow 30m` holds every ultralow
+    session); anything else opens the duration, then a free-text reason.
+    """
+    tokens = (rest or "").split()
+    scope = session_id or pause.ALL
+    if tokens and tokens[0] in _SCOPES:
+        scope = pause.mode_scope(tokens[0]) if tokens[0] in gate.MODES else tokens[0]
+        tokens = tokens[1:]
+    duration = tokens[0] if tokens else ""
+    return scope, duration, " ".join(tokens[1:])
+
+
+def do_pause(state: Any, policy: gate.Policy, scope: str, duration: str,
+             reason: str) -> str:
+    until, label = pause.parse_duration(duration or "indef")
+    if not label:
+        return ("gpu-gate: I did not understand `%s` — try `30m`, `2h`, `45s`, "
+                "`until 15:30` or `indef`" % duration)
+    record = pause.write(state, scope, until, reason, "manual", policy.indefinite_max_s)
+    return "gpu-gate: paused — %s" % pause.describe(record)
+
+
+def do_resume(state: Any, scope: str) -> str:
+    return ("gpu-gate: resumed — %s" % scope if pause.clear(state, scope)
+            else "gpu-gate: no pause on %s" % scope)
+
+
+def do_pauses(state: Any) -> str:
+    rows = pause.listing(state)
+    if not rows:
+        return "gpu-gate: nothing is paused"
+    return "gpu-gate, live pauses:\n" + "\n".join(
+        "- %s · %s · %s" % (pause.describe(row), time.strftime("%H:%M:%S",
+                                                              time.localtime(row["ts"])),
+                            row["source"]) for row in rows)
+
+
+def do_perf(state: Any, policy: gate.Policy, limit: int = 12, needle: str = "") -> str:
+    rows = gate.journal_read(getattr(state, "data_dir", None), 400, needle,
+                             name=perf.JOURNAL_NAME)
+    calls = [row for row in rows if "decode_tps" in row or "output_tokens" in row]
+    block = perf.fmt_summary(perf.summarise(list(reversed(calls))))
+    lines = ["gpu-gate, last %d sampled calls (thresholds: decode < %.1f t/s, "
+             "cache < %.0f%%, %d in a row; auto-pause %s)"
+             % (len(calls), policy.perf_decode_tps_min, policy.perf_cache_ratio_min * 100,
+                policy.perf_consecutive,
+                "ARMED %.0f-%.0fs" % (policy.auto_pause_min_s, policy.auto_pause_max_s)
+                if policy.auto_pause_enabled else "off"),
+             block]
+    if rows:
+        lines.append("recent:")
+        for row in rows[:limit]:
+            stamp = time.strftime("%H:%M:%S", time.localtime(float(row.get("ts", 0) or 0)))
+            if row.get("kind"):
+                lines.append("- %s · %s · %s · %s" % (stamp, row["kind"],
+                                                      str(row.get("session", "?"))[-12:],
+                                                      row.get("detail", "")))
+            else:
+                lines.append("- %s · %s · %s t/s · cache %s · %s tok out / %s s · %s" % (
+                    stamp, str(row.get("session", "?"))[-12:], row.get("decode_tps"),
+                    row.get("cache_ratio"), row.get("output_tokens"),
+                    row.get("duration_s"), row.get("model", "")))
+    return "\n".join(lines)
+
+
 def make_slash(ctx: Any, settings: Settings, cache: gate.VerdictCache, state: Any):
-    """/gpu-prio [low|ultralow|normal|auto|status|log] — tags the current session."""
+    """/gpu-prio [low|ultralow|normal|auto|status|log|pause|resume|pauses|perf]."""
 
     def handler(raw_args: str, session_id: str = "", **_kw: Any) -> str:
         policy = settings.get()
-        verb = (raw_args or "").strip().lower()
+        parts = (raw_args or "").strip().split(None, 1)
+        verb, rest = (parts[0].lower() if parts else ""), (parts[1] if len(parts) > 1 else "")
         if verb in gate.MODES:
             gate.write_tag(state, session_id, verb)
             return "gpu-gate: session %s → **%s**" % (session_id or "?", verb)
@@ -299,13 +539,31 @@ def make_slash(ctx: Any, settings: Settings, cache: gate.VerdictCache, state: An
             mode, origin = resolve_mode(ctx, state, session_id, "", policy)
             return ("gpu-gate: tag removed, current mode **%s** (%s)" % (mode, origin) if verb
                     else _usage(session_id, ctx, state, policy))
+        if verb == "pause":
+            scope, duration, reason = parse_pause_args(rest, session_id)
+            return do_pause(state, policy, scope, duration, reason)
+        if verb == "resume":
+            target = (rest or "").strip() or session_id
+            scope = pause.mode_scope(target) if target in gate.MODES else target
+            return do_resume(state, scope)
+        if verb == "pauses":
+            return do_pauses(state)
+        if verb == "perf":
+            limit = 12
+            if (rest or "").isdigit():
+                limit = max(1, int(rest))
+            return do_perf(state, policy, limit)
         if verb == "status":
             v = cache.get(force=True)
             mode, origin = resolve_mode(ctx, state, session_id, "", policy)
-            return ("gpu-gate: session **%s** (%s)\n- verdict: %s\n- budget: %.0fs "
-                    "(unattended %.0fs), no slot → we proceed anyway"
-                    % (mode, origin, _fmt_verdict(v), policy.max_wait_s,
-                       policy.max_wait_unattended_s))
+            held, record = pause.check(state, session_id, mode)
+            return ("gpu-gate: session **%s** (%s)%s\n- verdict: %s\n- budget: %.0fs "
+                    "(unattended %.0fs), no slot → we proceed anyway\n- pause hold: %.0fs "
+                    "max inside a turn"
+                    % (mode, origin,
+                       "\n- **PAUSED**: %s" % pause.describe(record) if held else "",
+                       _fmt_verdict(v), policy.max_wait_s,
+                       policy.max_wait_unattended_s, policy.pause_max_wait_s))
         if verb == "log":
             rows = gate.journal_read(getattr(state, "data_dir", None), 5, session_id)
             if not rows:
@@ -331,28 +589,62 @@ def _fmt_verdict(v: dict) -> str:
 
 def _usage(session_id: str, ctx: Any, state: Any, policy: gate.Policy) -> str:
     mode, origin = resolve_mode(ctx, state, session_id, "", policy)
+    held, record = pause.check(state, session_id, mode)
     return ("`/gpu-prio low|ultralow|normal` — tag this session\n"
             "`/gpu-prio log` — this session's latest decisions\n"
             "`/gpu-prio auto` — remove the tag (back to the auto rule)\n"
             "`/gpu-prio status` — the gate's verdict\n"
-            "Current mode: **%s** (%s), quiet required %.0fs, engine %s"
-            % (mode, origin, policy.idle_min_s, policy.url))
+            "`/gpu-prio pause [30m|until 15:30|indef] [reason]` — hold this session; "
+            "add `all` or a mode first to hold a whole class\n"
+            "`/gpu-prio resume [all|mode|session]` · `/gpu-prio pauses` — lift / list\n"
+            "`/gpu-prio perf [n]` — measured decode rate and cache ratio\n"
+            "Current mode: **%s** (%s), quiet required %.0fs, engine %s%s"
+            % (mode, origin, policy.idle_min_s, policy.url,
+               "\n**On pause**: %s" % pause.describe(record) if held else ""))
 
 
 def make_cli(ctx: Any, state: Any, settings: Settings):
-    """`hermes gpu-prio` — view and set tags from outside a session."""
+    """`hermes gpu-prio` — view and set tags, pauses and perf from outside a session."""
 
     def setup(sub: Any) -> None:
-        sub.add_argument("verb", choices=["ls", "get", "set", "rm", "status", "log"],
+        sub.add_argument("verb", choices=["ls", "get", "set", "rm", "status", "log",
+                                          "pause", "resume", "pauses", "perf"],
                          help="ls: active tags · get/set/rm <session> [mode] · "
-                              "status: verdict · log [n|session]: recent decisions")
-        sub.add_argument("session", nargs="?", default="", help="session identifier")
-        sub.add_argument("mode", nargs="?", default="", choices=list(gate.MODES) + [""])
+                              "status: verdict · log [n|session]: recent decisions · "
+                              "pause <session|all|mode> [30m|until 15:30|indef] [reason] · "
+                              "resume <scope> · pauses · perf [n|session]")
+        sub.add_argument("session", nargs="?", default="", help="session identifier or scope")
+        sub.add_argument("arg", nargs="?", default="",
+                         help="mode for `set`, duration for `pause`, count for `log`/`perf`")
+        sub.add_argument("rest", nargs="*", default=[], help="pause reason, free text")
 
     def run(args: Any) -> None:
         policy = settings.get()
         verb = getattr(args, "verb", "ls")
         session = getattr(args, "session", "") or ""
+        arg = getattr(args, "arg", "") or ""
+        if verb == "pause":
+            if not session:
+                print("a scope is required: a session id, `all`, or a mode")
+                return
+            duration = arg if arg not in gate.MODES else ""
+            reason = " ".join(getattr(args, "rest", []))
+            print(do_pause(state, policy, session, duration, reason))
+            return
+        if verb == "resume":
+            print(do_resume(state, session or pause.ALL))
+            return
+        if verb == "pauses":
+            print(do_pauses(state))
+            return
+        if verb == "perf":
+            limit, needle = 12, ""
+            if session.isdigit():
+                limit = max(1, int(session))
+            else:
+                needle = session
+            print(do_perf(state, policy, limit, needle))
+            return
         if verb == "log":
             limit, needle = 20, ""
             if session.isdigit():
@@ -407,7 +699,7 @@ def make_cli(ctx: Any, state: Any, settings: Settings):
         if verb == "get":
             print(gate.read_tag(state, session, policy.tag_ttl_days) or "no tag")
         elif verb == "set":
-            mode = getattr(args, "mode", "") or ""
+            mode = arg
             if mode not in gate.MODES:
                 print("expected mode: %s" % " | ".join(gate.MODES))
                 return
@@ -425,21 +717,31 @@ def register(ctx: Any) -> None:
                               lambda: settings.get().timeout_s,
                               lambda: settings.get().cache_s)
     state = ctx.state
+    tracker = perf.SlowTracker()
 
     ctx.register_middleware("llm_execution", make_middleware(ctx, settings, cache, state))
+    ctx.register_hook("post_api_request", make_perf_hook(settings, state, tracker))
+    ctx.register_hook("pre_llm_call", make_pause_gate(ctx, settings, state))
     ctx.register_command("gpu-prio", handler=make_slash(ctx, settings, cache, state),
-                         description="GPU gate: low / ultralow priority for this session.",
-                         args_hint="[low|ultralow|normal|auto|status|log]")
+                         description="GPU gate: priority, pause and speed of this session.",
+                         args_hint="[low|ultralow|normal|auto|status|log|pause|resume"
+                                   "|pauses|perf]")
     setup_fn, handler_fn = make_cli(ctx, state, settings)
     ctx.register_cli_command("gpu-prio", help=_HELP, description=_HELP,
                              setup_fn=setup_fn, handler_fn=handler_fn)
 
     def prune(session_id: str = "", **_kw: Any) -> None:
-        """The tag follows the session's life: deleted, its tag goes too."""
+        """The tag and any pause follow the session's life: deleted, they go too."""
         if gate.drop_tag(state, session_id):
             logger.debug("gpu-gate: tag removed (session deleted) %s", session_id)
+        pause.clear(state, pause.scope_of_session(session_id))
 
     ctx.register_hook("on_session_delete", prune)
-    logger.info("gpu-gate: active — verdict %s, quiet %.0fs, budgets %.0f/%.0fs",
-                settings.get().url, settings.get().idle_min_s, settings.get().max_wait_s,
-                settings.get().max_wait_unattended_s)
+    policy = settings.get()
+    logger.info("gpu-gate: active — verdict %s, quiet %.0fs, budgets %.0f/%.0fs, "
+                "pause hold %.0fs, perf %s, auto-pause %s",
+                policy.url, policy.idle_min_s, policy.max_wait_s,
+                policy.max_wait_unattended_s, policy.pause_max_wait_s,
+                "on" if policy.perf_enabled else "off",
+                "ARMED %.0f-%.0fs" % (policy.auto_pause_min_s, policy.auto_pause_max_s)
+                if policy.auto_pause_enabled else "off")

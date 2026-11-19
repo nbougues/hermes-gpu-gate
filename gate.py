@@ -69,6 +69,32 @@ class Policy:
     #: decision journal ceiling before rotation (the tail is kept); 0 disables it
     journal_max_bytes: float = 1_000_000.0
 
+    # ---- pause -----------------------------------------------------------
+    #: how long a *timed* pause may hold a turn that is already running. A pause is
+    #: inactivity, and inactivity is what the watchdogs count (`agent.turn_liveness`
+    #: 600 s, gateway 1800 s), so this must stay well under them: a pause longer than
+    #: this is honoured at the *next* turn instead, and the journal says `pause_overrun`.
+    pause_max_wait_s: float = 300.0
+    #: a forgotten indefinite pause must not freeze the fleet forever
+    indefinite_max_s: float = 21600.0
+
+    # ---- performance sampling -------------------------------------------
+    perf_enabled: bool = True
+    perf_max_bytes: float = 2_000_000.0
+    #: a call that produced almost nothing carries no speed signal
+    perf_min_output_tokens: int = 64
+    #: below this prompt size there was nothing worth caching: a low ratio is not a finding
+    perf_min_prompt_tokens: int = 2000
+    perf_decode_tps_min: float = 12.0
+    perf_cache_ratio_min: float = 0.25
+    #: how many slow calls in a row before anything is concluded
+    perf_consecutive: int = 3
+    # ---- automatic pause (off by default: measure first, then arm it) ----
+    auto_pause_enabled: bool = False
+    auto_pause_min_s: float = 20.0
+    auto_pause_max_s: float = 90.0
+    auto_pause_per_hour: int = 6
+
 
 def fetch_verdict(url: str, timeout: float = 2.0) -> dict:
     """Normalised `ia-free` verdict, or `{"ok": False, ...}` — never raises.
@@ -83,7 +109,8 @@ def fetch_verdict(url: str, timeout: float = 2.0) -> dict:
         return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
     if not isinstance(raw, dict):
         return {"ok": False, "error": "verdict is not an object"}
-    signals = raw.get("signals") if isinstance(raw.get("signals"), dict) else {}
+    raw_signals = raw.get("signals")
+    signals = raw_signals if isinstance(raw_signals, dict) else {}
     idle_for = raw.get("idle_for_s")
     if idle_for is None:  # older service: no idle field, ultralow falls back to `free`
         idle_for = 0.0 if not raw.get("free") else 1e9
@@ -94,6 +121,12 @@ def fetch_verdict(url: str, timeout: float = 2.0) -> dict:
         "idle_ok": bool(raw.get("idle_ok", float(idle_for or 0.0) >= 30.0)),
         "reason": str(raw.get("reason") or ""),
         "inflight": signals.get("inflight"),
+        # Engine throughput, straight from the same scrape the verdict is built from
+        # (`ia-free` adds these; an older service simply omits them → None).
+        "decode_tps": signals.get("decode_tps"),
+        "prefill_tps": signals.get("prefill_tps"),
+        "engine_cache_ratio": signals.get("cache_hit_ratio"),
+        "queue_wait_s": signals.get("queue_wait_longest_seconds"),
     }
 
 
@@ -166,6 +199,29 @@ def wait_for_slot(probe: Callable[[], dict], mode: str, entry: bool, policy: Pol
                 return waited, "budget_exhausted:" + why
             sleep(policy.slice_s)
     except Exception as exc:  # noqa: BLE001 - a broken gate must not kill the turn
+        return clock() - start, "error:%s: %s" % (type(exc).__name__, exc)
+
+
+def wait_while(hold: Callable[[], Optional[str]], budget_s: float, slice_s: float,
+               sleep: Callable[[float], None] = time.sleep,
+               clock: Callable[[], float] = time.monotonic) -> tuple[float, str]:
+    """Hold until `hold()` says we may go. `(seconds_waited, reason)`, never raises.
+
+    `hold()` returns None to release, or the reason it is still holding. Same shape as
+    `wait_for_slot` for the same reason: a pause is a wait, and a wait that outlives a
+    watchdog is worse than a wait that gives up. Past the budget we proceed anyway and
+    say `pause_overrun` — the pause was honoured as far as the turn could afford.
+    """
+    start = clock()
+    try:
+        while True:
+            why = hold()
+            if why is None:
+                return clock() - start, "resumed"
+            if clock() - start - slice_s > budget_s:
+                return clock() - start, "pause_overrun:" + why
+            sleep(slice_s)
+    except Exception as exc:  # noqa: BLE001 - a broken pause check must not kill the turn
         return clock() - start, "error:%s: %s" % (type(exc).__name__, exc)
 
 
@@ -247,18 +303,19 @@ JOURNAL_NAME = "decisions.jsonl"
 _journal_lock = threading.Lock()
 
 
-def journal_path(data_dir: Any) -> Any:
+def journal_path(data_dir: Any, name: str = JOURNAL_NAME) -> Any:
     from pathlib import Path
-    return Path(str(data_dir)) / JOURNAL_NAME
+    return Path(str(data_dir)) / name
 
 
-def journal_write(data_dir: Any, record: dict, max_bytes: float = 1_000_000.0) -> bool:
+def journal_write(data_dir: Any, record: dict, max_bytes: float = 1_000_000.0,
+                  name: str = JOURNAL_NAME) -> bool:
     """Append one decision to the journal. Never raises: a journal that fails to
     write must never keep a turn from running (same fail-open as the gate)."""
     if max_bytes <= 0 or data_dir is None:
         return False
     try:
-        path = journal_path(data_dir)
+        path = journal_path(data_dir, name)
         path.parent.mkdir(parents=True, exist_ok=True)
         line = (json.dumps(record, ensure_ascii=False, default=str) + "\n").encode()
         with _journal_lock:
@@ -277,13 +334,14 @@ def journal_write(data_dir: Any, record: dict, max_bytes: float = 1_000_000.0) -
 
 
 def journal_read(data_dir: Any, limit: int = 20,
-                 session: str = "", since: float = 0.0) -> list[dict]:
+                 session: str = "", since: float = 0.0,
+                 name: str = JOURNAL_NAME) -> list[dict]:
     """Latest decisions first, filtered by `session` (substring) and `since`
     (epoch timestamp)."""
     if data_dir is None:
         return []
     try:
-        path = journal_path(data_dir)
+        path = journal_path(data_dir, name)
         size = path.stat().st_size
         with open(path, "rb") as fh:
             fh.seek(max(0, size - 400_000))

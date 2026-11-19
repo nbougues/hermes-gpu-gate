@@ -106,7 +106,7 @@ BUSY = {"free": False, "reason": "inflight_above_limit", "idle_for_s": 0.0,
         "idle_ok": False, "signals": {"inflight": 3}}
 
 FAST = {"verdict_cache_s": 0.0, "poll_slice_s": 0.05, "verdict_timeout_s": 1.0,
-        "max_wait_s": 1.0, "max_wait_unattended_s": 0.2}
+        "max_wait_s": 1.0, "max_wait_unattended_s": 0.2, "pause_max_wait_s": 0.25}
 
 LOCAL = "http://10.0.0.5:4000/v1"
 
@@ -306,6 +306,133 @@ check("middleware: a mid-turn wait is recorded", len(forced), 1)
 check("middleware: iteration number recorded", forced[0]["iter"], 7)
 check("middleware: wait measured", float(forced[0]["waited_s"]) > 0, True)
 check("middleware: budget recorded", float(forced[0]["budget_s"]), 1.0)
+
+print("\npause: held, released, journalled")
+pause = plugin.pause
+srv = VerdictServer(FREE)
+ctx = FakeCtx()
+policy = gate.Policy(pause_max_wait_s=0.25, slice_s=0.05)
+check("no pause → not held", pause.check(ctx.state, "p1", "low"), (False, {}))
+pause.write(ctx.state, "p1", time.time() + 30, "hold on")
+held, record = pause.check(ctx.state, "p1", "low")
+check("timed pause is held", held, True)
+waited, why = plugin._hold(ctx.state, "p1", "low", record, policy)
+check("a pause past its cap lets the turn through", why.startswith("pause_overrun"), True)
+check("…and the wait was real", waited >= 0.2, True)
+pause.clear(ctx.state, "p1")
+waited, why = plugin._hold(ctx.state, "p1", "low", record, policy)
+check("a resumed pause releases at once", (waited < 0.1, why), (True, "resumed"))
+# a deadline just ahead is waited out, not overrun
+pause.write(ctx.state, "p2", time.time() + 0.15)
+_held, rec2 = pause.check(ctx.state, "p2", "low")
+waited, why = plugin._hold(ctx.state, "p2", "low", rec2, policy)
+check("a short pause is waited out", why, "resumed")
+check("…for about its length", 0.1 <= waited <= 0.6, True)
+# the middleware itself: a pause on `all` holds even a `normal` session
+ctx2 = FakeCtx()
+ctx2._settings = dict(FAST, verdict_url=srv.url)
+settings_obj = plugin.Settings(ctx2)
+cache = gate.VerdictCache(lambda: settings_obj.get().url, lambda: settings_obj.get().timeout_s,
+                          lambda: settings_obj.get().cache_s)
+mw = plugin.make_middleware(ctx2, settings_obj, cache, ctx2.state)
+pause.write(ctx2.state, pause.ALL, time.time() + 30, "deploy window")
+start = time.monotonic()
+calls = []
+mw(request={"model": "x"}, next_call=lambda r: calls.append(r) or "answer",
+   session_id="p3", platform="cli", base_url=LOCAL, api_call_count=1)
+check("a normal session is held by a global pause", len(calls), 1)
+check("…and it actually waited", time.monotonic() - start >= 0.2, True)
+rows = gate.journal_read(ctx2.state.data_dir, 5, "p3")
+check("the pause wait is journalled", len(rows), 1)
+check("…and says it was a pause", rows[0]["outcome"].startswith("pause:pause_overrun"), True)
+check("…naming the scope", "all" in rows[0]["pause"], True)
+srv.stop()
+
+print("\npause: an indefinite one refuses the turn instead of burning it")
+ctx = FakeCtx()
+gate_hook = plugin.make_pause_gate(ctx, plugin.Settings(ctx), ctx.state)
+check("no pause → the turn goes through", gate_hook(session_id="q1"), None)
+pause.write(ctx.state, "q1", None, "hand brake")
+verdict = gate_hook(session_id="q1")
+check("indefinite pause vetoes the turn", verdict.get("action"), "block")
+check("…and tells the user the message was dropped",
+      "not" in verdict["message"] and "replay" in verdict["message"], True)
+pause.write(ctx.state, "q2", time.time() + 600, "short hold")
+check("a timed pause does NOT veto (the middleware waits it out)",
+      gate_hook(session_id="q2"), None)
+pause.write(ctx.state, pause.mode_scope(gate.ULTRALOW), None, "ultralow off")
+gate.write_tag(ctx.state, "q3", gate.ULTRALOW)
+check("a mode pause catches an ultralow session",
+      gate_hook(session_id="q3", platform="cli").get("action"), "block")
+check("…and leaves a normal session alone",
+      gate_hook(session_id="q4", platform="cli"), None)
+
+print("\nperf hook: sampling and the auto-pause it can arm")
+ctx = FakeCtx({"perf_consecutive": 2, "auto_pause_enabled": True,
+               "auto_pause_min_s": 30, "auto_pause_max_s": 31, "perf_decode_tps_min": 12.0})
+tracker = plugin.perf.SlowTracker()
+hook = plugin.make_perf_hook(plugin.Settings(ctx), ctx.state, tracker)
+slow_payload = {"session_id": "z1", "api_duration": 100.0, "started_at": 1000.0,
+                "first_chunk_at": 1002.0, "model": "local", "base_url": LOCAL,
+                "usage": {"input_tokens": 30000, "output_tokens": 500, "cached_tokens": 29000}}
+hook(**slow_payload)
+check("one slow call is not enough", pause.read(ctx.state, "z1"), None)
+hook(**slow_payload)
+held, record = pause.check(ctx.state, "z1", "normal")
+check("the second one auto-pauses the session", held, True)
+check("…for the configured window", 29 <= pause.remaining(record) <= 31, True)
+check("…and says why", record["source"], "auto:%s" % plugin.perf.SLOW_DECODE)
+rows = gate.journal_read(ctx.state.data_dir, 10, name=plugin.perf.JOURNAL_NAME)
+check("the samples are journalled", len([r for r in rows if r.get("output_tokens")]), 2)
+check("the auto-pause is journalled too",
+      len([r for r in rows if r.get("kind") == "auto_pause"]), 1)
+check("a call with no usage is not journalled",
+      hook(session_id="z2", api_duration=None, usage=None), None)
+# disarmed by default: the streak is logged, nothing is paused
+ctx_off = FakeCtx({"perf_consecutive": 1})
+hook_off = plugin.make_perf_hook(plugin.Settings(ctx_off), ctx_off.state, plugin.perf.SlowTracker())
+hook_off(**slow_payload)
+check("auto-pause off by default", pause.check(ctx_off.state, "z3", "normal")[0], False)
+check("…but the streak is journalled",
+      len([r for r in gate.journal_read(ctx_off.state.data_dir, 10,
+                                        name=plugin.perf.JOURNAL_NAME)
+           if r.get("kind") == "slow_streak"]), 1)
+
+print("\ncommands: pause / resume / pauses / perf")
+ctx = FakeCtx()
+srv = VerdictServer(FREE)
+cmd_cache = gate.VerdictCache(lambda: srv.url, lambda: 1.0, lambda: 0.0)
+slash = plugin.make_slash(ctx, plugin.Settings(ctx), cmd_cache, ctx.state)
+check("/gpu-prio pause 30m", "paused" in slash("pause 30m", session_id="c1"), True)
+check("…is a timed pause on this session", pause.read(ctx.state, "c1")["until"] > time.time(), True)
+check("/gpu-prio pause all indef", "indefinite" in slash("pause all indef deploy", session_id="c1"), True)
+check("…with the reason kept", [r for r in pause.listing(ctx.state) if r["scope"] == "all"][0]["reason"], "deploy")
+check("/gpu-prio pauses lists both", len(slash("pauses", session_id="c1").splitlines()), 3)
+check("/gpu-prio resume lifts this session", "resumed" in slash("resume", session_id="c1"), True)
+check("…and the global one stays", pause.check(ctx.state, "c1", "normal")[0], True)
+check("/gpu-prio resume all", "resumed" in slash("resume all", session_id="c1"), True)
+check("nothing is paused now", slash("pauses", session_id="c1"), "gpu-gate: nothing is paused")
+check("an unparsable duration is refused", "did not understand" in slash("pause soon", session_id="c1"), True)
+check("status mentions the pause cap", "pause hold" in slash("status", session_id="c1"), True)
+check("perf answers even with no data", "decode t/s" in slash("perf", session_id="c1"), True)
+check("scope parsing: mode word is a scope", plugin.parse_pause_args("ultralow 30m why", "c9"),
+      ("mode:ultralow", "30m", "why"))
+check("scope parsing: bare duration is this session", plugin.parse_pause_args("45s", "c9"),
+      ("c9", "45s", ""))
+setup, run = plugin.make_cli(ctx, ctx.state, plugin.Settings(ctx))
+run(cli_parser.parse_args(["pause", "all", "10m", "maintenance"]))
+check("CLI pause", pause.read(ctx.state, "all")["reason"], "maintenance")
+run(cli_parser.parse_args(["resume", "all"]))
+check("CLI resume", pause.read(ctx.state, "all"), None)
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    run(cli_parser.parse_args(["pauses"]))
+check("CLI pauses", "nothing is paused" in _out.getvalue(), True)
+_out = io.StringIO()
+with contextlib.redirect_stdout(_out):
+    run(cli_parser.parse_args(["perf"]))
+check("CLI perf", "decode t/s" in _out.getvalue(), True)
+srv.stop()
 
 print("\n%d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

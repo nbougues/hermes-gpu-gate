@@ -28,7 +28,8 @@ command -v "$HERMES_BIN" >/dev/null || { echo "'$HERMES_BIN' not found (HERMES_B
 DEST="$HOME_DIR/plugins/gpu-gate"
 echo "== copying into $DEST"
 mkdir -p "$DEST"
-install -m 0644 "$HERE/plugin.yaml" "$HERE/__init__.py" "$HERE/gate.py" "$DEST/"
+install -m 0644 "$HERE/plugin.yaml" "$HERE/__init__.py" "$HERE/gate.py" \
+  "$HERE/pause.py" "$HERE/perf.py" "$DEST/"
 install -m 0755 "$HERE/recover_interrupted.py" "$DEST/"
 
 echo "== validating the manifest"

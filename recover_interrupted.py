@@ -13,9 +13,25 @@ The user message is then sitting there unanswered, and nothing retries it. This
 script finds those sessions and re-submits a short continuation nudge so the
 turn resumes on its own, on a schedule (cron, every 10 minutes).
 
-Detection is deliberately narrow: the **last active message** of the session
-must be that sentinel. A session that got a real answer afterwards is healthy
-and is never touched.
+Detection looks at the **last meaningful message** of each live session and
+restarts it only when that message is a proven death, never an answer:
+
+* ``Operation interrupted: waiting for model response (…)`` — an interrupt (Stop,
+  shutdown, busy-submit) landed mid-call;
+* ``display_kind = 'failed_turn'`` — the turn liveness watchdog aborted the turn
+  ("Turn made no progress for 600s"). A gpu-gate wait longer than
+  ``agent.turn_liveness.timeout_s`` dies exactly this way, so this is the shape
+  the gate itself produces.
+
+Rows the turn loop appends *after* the fact — a compaction handoff, a
+notification — are not answers and are skipped, so a marker buried under one is
+still found. A session whose last message is a real answer, a bare user prompt
+or a tool result is never touched.
+
+Every run prints a census (sessions seen, how each one's last message was
+classified, live leases, markers seen in 24 h) and appends it to
+``plugin-data/gpu-gate/recover.jsonl``, so a run that restarts nothing says what
+it looked at instead of looking broken.
 
 Two throttles keep the recovery from becoming the load spike it is recovering
 from (see ``--help``): at most ``--max`` restarts per run, and only while the
@@ -69,6 +85,25 @@ NUDGE = (
     "not redo steps that already completed."
 )
 
+#: the liveness watchdog's own words, stored as ``display_kind='failed_turn'``:
+#: "Turn made no progress for 600s; aborting to release the session." lands here
+#: (agent/turn_liveness.py -> agent/turn_failure_copy.py). A gpu-gate wait longer
+#: than ``agent.turn_liveness.timeout_s`` is killed with exactly this copy, so a
+#: recovery that only knows about SENTINEL_PREFIX never sees the deaths the gate
+#: itself causes.
+FAILED_TURN_KIND = "failed_turn"
+
+#: trailing rows that are not an answer and must not hide the marker underneath
+#: them. This is Hermes' own definition of machinery rows — see
+#: ``agent/turn_empty_response.py::_MACHINERY_DISPLAY_KINDS`` — plus ``hidden``.
+IGNORED_DISPLAY_KINDS = ("hidden", "internal_notification", "process_complete",
+                         "async_delegation_complete")
+
+#: compaction handoff rows are assistant messages too, and they land *after* the
+#: sentinel of the turn they summarise — they must not count as "the session was
+#: answered".
+IGNORED_CONTENT_PREFIXES = ("[PRIOR CONTEXT", "[CONTEXT COMPACTION")
+
 
 # ------------------------------------------------------------------- settings
 
@@ -121,6 +156,7 @@ class Candidate:
     cwd: str
     interrupted_at: float
     age_s: float
+    kind: str = "sentinel"
     last_prompt: str = ""
     reason: str = field(default="", repr=False)
 
@@ -130,21 +166,43 @@ class Candidate:
             (self.title or "(untitled)")[:48])
 
 
-#: the last active message of the session must be the sentinel, so a session that
-#: was answered afterwards (by hand or by an earlier recovery) never matches
-_SQL_CANDIDATES = """
-SELECT s.id, IFNULL(s.source,''), IFNULL(s.title,''), IFNULL(s.cwd,''), m.timestamp,
-       (SELECT u.content FROM messages u
-         WHERE u.session_id = s.id AND u.role = 'user' AND u.active = 1 AND u.id < m.id
-         ORDER BY u.id DESC LIMIT 1)
-  FROM sessions s
-  JOIN messages m ON m.id = (SELECT id FROM messages
-                              WHERE session_id = s.id AND active = 1
-                              ORDER BY id DESC LIMIT 1)
- WHERE m.role = 'assistant' AND m.content LIKE ?
-   AND IFNULL(s.archived, 0) = 0
- ORDER BY m.timestamp ASC
-"""
+#: The **last meaningful message** of each live session, whatever it is, so the
+#: run can report what it found instead of silently matching nothing. Rows the
+#: turn loop appends after the fact (compaction handoff, notifications) are not
+#: answers and are skipped, otherwise a sentinel buried under one of them is
+#: invisible forever — which is exactly how every gated death so far was missed.
+_SQL_LAST_MESSAGE = (
+    "WITH last AS (SELECT session_id, MAX(id) AS id FROM messages "
+    "   WHERE active = 1 AND IFNULL(display_kind,'') NOT IN (%s) AND %s "
+    "   GROUP BY session_id) "
+    "SELECT s.id, IFNULL(s.source,''), IFNULL(s.title,''), IFNULL(s.cwd,''), m.timestamp, "
+    "       m.role, IFNULL(m.display_kind,''), substr(IFNULL(m.content,''), 1, 400), "
+    "       (SELECT u.content FROM messages u WHERE u.session_id = s.id AND u.role = 'user' "
+    "        AND u.active = 1 AND u.id < m.id ORDER BY u.id DESC LIMIT 1) "
+    "  FROM sessions s JOIN last l ON l.session_id = s.id JOIN messages m ON m.id = l.id "
+    " WHERE IFNULL(s.archived, 0) = 0 ORDER BY m.timestamp ASC"
+) % (
+    ",".join("'%s'" % k for k in IGNORED_DISPLAY_KINDS),
+    " AND ".join("IFNULL(content,'') NOT LIKE '%s%%'" % p
+                 for p in IGNORED_CONTENT_PREFIXES),
+)
+
+#: how many of these restart the session; the rest are census material
+RESTARTABLE = ("sentinel", "failed_turn")
+
+
+def classify(role: str, display_kind: str, content: str) -> str:
+    """One word for what a session's last message means. ``answered`` and
+    ``mid_flight`` are the two shapes that must never be restarted."""
+    if (content or "").startswith(SENTINEL_PREFIX):
+        return "sentinel"
+    if display_kind == FAILED_TURN_KIND:
+        return "failed_turn"
+    if role == "user":
+        return "unanswered_user"
+    if role == "tool":
+        return "mid_flight"
+    return "answered"
 
 
 def open_db(home: Path) -> sqlite3.Connection:
@@ -162,17 +220,29 @@ def live_session_ids(conn: sqlite3.Connection, now: float) -> set:
     return {str(r[0]) for r in rows}
 
 
-def find_candidates(conn: sqlite3.Connection, opts: Options, now: float) -> tuple[list, list]:
-    """→ (restartable candidates oldest-first, skipped list of (Candidate, why))."""
+def scan(conn: sqlite3.Connection, opts: Options, now: float):
+    """→ (restartable candidates oldest-first, skipped [(Candidate, why)], census).
+
+    The census is the point of the whole function: a run that finds nothing has
+    to say *what it looked at*, or "it never fires" stays undiagnosable.
+    """
     live = live_session_ids(conn, now)
     picks: list[Candidate] = []
     skipped: list[tuple[Candidate, str]] = []
-    for row in conn.execute(_SQL_CANDIDATES, (_SENTINEL_LIKE,)):
+    census = {"sessions": 0, "by_last_message": {}, "leases_live": len(live),
+              "markers_recent": 0}
+    for row in conn.execute(_SQL_LAST_MESSAGE):
         # positional: the script must not depend on a row factory
-        age = now - float(row[4] or 0)
-        cand = Candidate(session_id=str(row[0]), source=str(row[1]), title=str(row[2]),
-                         cwd=str(row[3]), interrupted_at=float(row[4] or 0),
-                         age_s=age, last_prompt=str(row[5] or ""))
+        sid, source, title, cwd, ts, role, display_kind, content, last_prompt = row
+        age = now - float(ts or 0)
+        kind = classify(str(role), str(display_kind), str(content or ""))
+        cand = Candidate(session_id=str(sid), source=str(source), title=str(title),
+                         cwd=str(cwd), interrupted_at=float(ts or 0), age_s=age,
+                         kind=kind, last_prompt=str(last_prompt or ""))
+        census["sessions"] += 1
+        census["by_last_message"][kind] = census["by_last_message"].get(kind, 0) + 1
+        if kind not in RESTARTABLE:
+            continue
         if cand.session_id in live:
             skipped.append((cand, "turn lease is live"))
         elif age < opts.min_age_s:
@@ -183,7 +253,31 @@ def find_candidates(conn: sqlite3.Connection, opts: Options, now: float) -> tupl
             skipped.append((cand, "source %r not selected" % cand.source))
         else:
             picks.append(cand)
-    return picks, skipped
+    census["markers_recent"] = _recent_markers(conn, now)
+    return picks, skipped, census
+
+
+def _recent_markers(conn: sqlite3.Connection, now: float, window_s: float = 86400.0) -> int:
+    """Sessions carrying an interruption marker in the last day, wherever it sits.
+
+    Non-zero with zero picks means the markers are being written and something
+    else is answering (or restarting) them; zero means the marker pipeline
+    itself is the problem.
+    """
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(DISTINCT session_id) FROM messages WHERE active = 1 AND timestamp > ? "
+            "  AND (content LIKE ? OR IFNULL(display_kind,'') = ?)",
+            (now - window_s, _SENTINEL_LIKE, FAILED_TURN_KIND)).fetchone()[0])
+    except (sqlite3.Error, TypeError):
+        return 0
+
+
+def fmt_census(census: dict) -> str:
+    parts = " ".join("%s=%d" % (k, v) for k, v in sorted(census["by_last_message"].items()))
+    return ("recover-interrupted: census %d session(s) [%s] leases_live=%d "
+            "markers_24h=%d" % (census["sessions"], parts or "none",
+                                census["leases_live"], census["markers_recent"]))
 
 
 # -------------------------------------------------------------------- ledger
@@ -232,14 +326,26 @@ def prune_ledger(ledger: dict, now: float, window_s: float) -> dict:
     return keep
 
 
-def journal(data_dir: Path, record: dict) -> None:
+def journal(data_dir: Path, record: dict, name: str = "restarts.jsonl") -> None:
     """Append-only audit trail; a journal that cannot be written never stops a recovery."""
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
-        with open(data_dir / "restarts.jsonl", "a", encoding="utf-8") as fh:
+        with open(data_dir / name, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except OSError:
         pass
+
+
+def _census_journal(opts: Options, now: float, census: dict, picks: int, skipped: int) -> None:
+    """One line per run, including the runs that did nothing. "It never fires" is
+    only diagnosable if every tick left a trace of what it looked at."""
+    journal(opts.data_dir, {"ts": round(now, 3), "kind": "census",
+                            "sessions": census["sessions"],
+                            "by_last_message": census["by_last_message"],
+                            "leases_live": census["leases_live"],
+                            "markers_24h": census["markers_recent"],
+                            "picks": picks, "skipped": skipped},
+            name="recover.jsonl")
 
 
 # --------------------------------------------------------------------- verdict
@@ -340,9 +446,11 @@ def run(opts: Options) -> int:
             return 0
         conn = open_db(opts.home)
         try:
-            picks, skipped = find_candidates(conn, opts, started)
+            picks, skipped, census = scan(conn, opts, started)
+            print(fmt_census(census))
+            _census_journal(opts, started, census, len(picks), len(skipped))
             for cand, why in skipped:
-                print("  skip   %s — %s" % (cand.brief(), why))
+                print("  skip   %s — %s [%s]" % (cand.brief(), why, cand.kind))
             if not picks:
                 print("recover-interrupted: no session on an unanswered interruption")
                 return 0
@@ -377,7 +485,8 @@ def run(opts: Options) -> int:
                 done += 1
                 print("           %s %s" % ("done:" if ok else "FAILED:", detail[:300]))
                 journal(opts.data_dir, {
-                    "ts": round(time.time(), 3), "session": cand.session_id,
+                    "ts": round(time.time(), 3), "kind": "restart", "marker": cand.kind,
+                    "session": cand.session_id,
                     "source": cand.source, "title": cand.title, "ok": ok,
                     "attempt": used + 1, "interrupted_at": cand.interrupted_at,
                     "waited_before_s": cand.age_s, "detail": detail[:500],

@@ -7,7 +7,11 @@ you are waiting on.
 `gpu-gate` is a [Hermes Agent](https://hermes-agent.nousresearch.com) plugin: no
 core modification, no proxy, no fork. It hooks the `llm_execution` middleware,
 asks a small HTTP service whether the engine has room, waits if it does not, and
-lets the request through when its budget runs out.
+lets the request through when its budget runs out. On top of the gate it adds
+**pauses** (hold a session, a mode or everything, for a fixed time or until you
+say otherwise) and **slowness detection** (decode tokens/s and prompt-cache reuse
+per call, with an optional automatic pause when a session degrades), plus a cron
+that resurrects sessions a torn-down turn left for dead.
 
 ```
 Hermes turn ── iteration ──▶ [ gpu-gate ] ──▶ provider call ──▶ inference server
@@ -183,11 +187,102 @@ Under `plugins.entries.gpu-gate.settings` in the profile's `config.yaml`:
 | `auto_low_platforms` | *(empty)* | legacy alias of `mode_by_platform` that maps those platforms to `low` |
 | `tag_ttl_days` | `7` | tag lifetime |
 | `journal_max_bytes` | `1000000` | decision journal ceiling before rotation; `0` turns it off |
+| `pause_max_wait_s` | `300` | how long a *timed* pause may hold a turn that is already inside the middleware; past that the turn proceeds and the pause stays armed for the next one |
+| `indefinite_max_s` | `21600` | safety net: an indefinite pause stops holding a waiting turn after this long (the pause itself remains, until `/gpu-prio resume`) |
+| `perf_enabled` | `true` | sample decode speed and prompt-cache reuse on every provider call (see *Measuring slowness*) |
+| `perf_max_bytes` | `2000000` | `perf.jsonl` ceiling before rotation; `0` turns the journal off |
+| `perf_decode_tps_min` | `12.0` | below this decoded tokens/s a call counts as slow |
+| `perf_cache_ratio_min` | `0.25` | below this prompt-cache reuse ratio a call counts as slow |
+| `perf_min_output_tokens` | `64` | a shorter answer carries no signal; not judged |
+| `perf_min_prompt_tokens` | `2000` | a prompt this small has nothing to reuse; the cache ratio is not judged |
+| `perf_consecutive` | `3` | slow calls in a row, same session, before anything is done about it |
+| `auto_pause_enabled` | `false` | actually pause the session when the streak trips (**off by default** — read `perf.jsonl` first) |
+| `auto_pause_min_s` / `auto_pause_max_s` | `20` / `90` | the pause length is drawn uniformly between these |
+| `auto_pause_per_hour` | `6` | per-session cap; past it a streak is journalled, not acted on |
 
 **Keep the budgets under your watchdogs**, otherwise the wait is cut before it
 ends: gateway inactivity `agent.gateway_timeout` (1800 s by default), cron
 inactivity (600 s), and any external launcher's `max_task_minutes` — that time is
 **shared** between waiting and working.
+
+## Pausing a session
+
+A mode says *how politely* a session waits. A pause says *do not run at all yet* —
+for a fixed time, or until you say so. Useful when the engine is about to be
+restarted, when a deploy is running, or when one session keeps producing junk and
+you want it stopped mid-fall rather than merely slowed.
+
+```
+/gpu-prio pause                      # this session, indefinitely
+/gpu-prio pause 30m                  # this session, 30 minutes
+/gpu-prio pause all 2h deploy        # every gated session, with a reason
+/gpu-prio pause ultralow 45s         # every ultralow session
+/gpu-prio pauses                     # what is armed, with what is left
+/gpu-prio resume                     # lift this session's pause
+/gpu-prio resume all
+```
+
+Same from the shell: `hermes gpu-prio pause all 10m maintenance`,
+`hermes gpu-prio resume all`, `hermes gpu-prio pauses`.
+
+A duration is `45s` / `30m` / `2h` / `until 15:30`; bare `pause` means indefinite.
+Scopes are this session (default), `all`, or a mode name.
+
+**A timed pause and an indefinite one behave differently, on purpose:**
+
+| | turn already inside the middleware | next turn |
+|---|---|---|
+| timed (`30m`) | held in place, up to `pause_max_wait_s` (300 s), then it proceeds and the pause stays armed for the next iteration | waits for the deadline |
+| indefinite | held up to `indefinite_max_s`, then proceeds | **refused** at `pre_llm_call`, before any inference |
+
+The indefinite case refuses because that is the only place Hermes lets a plugin
+say *no* cleanly. The refusal tells the user their message was **not** run and
+will not be replayed, so nothing is silently swallowed: a hand brake is supposed
+to be visible. A timed pause is a hold, not a refusal, so it never drops a turn —
+if it cannot be honoured within `pause_max_wait_s` the turn goes through and the
+journal records `pause:pause_overrun`.
+
+Every pause is journalled (`decisions.jsonl`, `kind: paused_turn` for refusals,
+`outcome: pause:…` for holds) with its scope, reason and remaining time, so
+"why did nothing run at 3 a.m." has an answer.
+
+## Measuring slowness
+
+`/gpu-prio perf` answers "is the engine actually slow right now, or does it just
+feel slow". Every provider call is sampled through the `post_api_request` hook —
+no core change, no proxy — and written to `perf.jsonl`:
+
+```json
+{"ts": 1762660000.1, "session": "local-febfef62…", "model": "qwen3", "iter": 4,
+ "duration_s": 21.4, "ttft_s": 1.8, "output_tokens": 512, "input_tokens": 30120,
+ "cached_tokens": 29440, "decode_tps": 26.1, "cache_ratio": 0.977}
+```
+
+`decode_tps` is output tokens over the time *after* the first chunk arrived, so
+queueing and prefill do not pollute it; a non-streaming call falls back to the
+whole duration and is marked `approx`. `cache_ratio` is reused prompt tokens over
+prompt tokens — the number that tells you a session is re-sending a cold prompt.
+
+A call counts as **slow** when `decode_tps < perf_decode_tps_min` **or**
+`cache_ratio < perf_cache_ratio_min`, with two guards so the rule cannot fire on
+noise: an answer shorter than `perf_min_output_tokens` carries no decode signal,
+and a prompt under `perf_min_prompt_tokens` has nothing to reuse. One slow call
+is a hiccup; `perf_consecutive` in a row in the same session is a trend.
+
+When a trend trips, the default action is **to write it down and do nothing**
+(`auto_pause_enabled: false`). The streak lands in `perf.jsonl` as
+`kind: slow_streak`. Turn the auto-pause on once you have seen what your normal
+looks like, and the same streak pauses the session for a duration drawn
+uniformly between `auto_pause_min_s` and `auto_pause_max_s` — random on purpose,
+so a fleet of sessions that all went slow together does not wake up together and
+go slow together again. `auto_pause_per_hour` caps the escalation per session;
+past it a streak is logged as `auto_pause_throttled` instead of stacking pauses.
+
+The engine's own view arrives with the verdict: the `/free` service reports
+`decode_tps`, `prefill_tps`, `cache_hit_ratio` and `queue_wait_longest_seconds`
+straight from the server's metrics, and those are journalled next to the client
+samples. When the two disagree, the client is right about what *it* experienced
+and the engine is right about *why*.
 
 ## Recovering interrupted turns
 
@@ -195,11 +290,20 @@ A gated session spends most of its life *inside* the middleware, waiting. From t
 turn loop's point of view an API call has been in flight the whole time, so
 anything that tears the session down while it waits — a desktop or backend
 shutdown, a `/stop`, a message typed into a session that is already busy — ends
-the turn with a sentinel instead of an answer:
+the turn with a marker instead of an answer. There are two, and a recovery that
+only knows one of them misses half the deaths:
 
 ```
-Operation interrupted: waiting for model response (726.6s elapsed).
+Operation interrupted: waiting for model response (726.6s elapsed).   ← an interrupt landed
+Your request was not processed. Send it again…                        ← display_kind=failed_turn:
+                                                                        the liveness watchdog
+                                                                        aborted a stalled turn
 ```
+
+The second one is the shape the gate itself produces: a wait longer than
+`agent.turn_liveness.timeout_s` (600 s) is aborted as "no progress", because the
+watchdog cannot tell waiting from hanging. That is why `pause_max_wait_s` and
+`max_wait_s` are kept well under it.
 
 The user message is then sitting there unanswered and nothing retries it.
 `recover_interrupted.py` is a standalone cron that finds those sessions and
@@ -218,9 +322,11 @@ What it will and will not touch:
 
 | Guard | Why |
 |---|---|
-| the **last active message** must be the sentinel | a session answered afterwards is healthy |
+| the **last meaningful message** must be one of the two markers | a session answered afterwards is healthy |
+| machinery rows are skipped, not treated as answers | a compaction handoff or a `process_complete` notice lands *after* the marker and would hide it forever (`hidden`, `internal_notification`, `process_complete`, `async_delegation_complete` — Hermes' own `_MACHINERY_DISPLAY_KINDS`) |
+| a session ending on a bare user prompt or a tool result is left alone | that is an abandoned session or a turn in flight, not a death |
 | no unexpired row in `session_turn_leases` | somebody is working on it right now |
-| `--min-age-s` (180 s) | a sentinel that just landed may still be finishing |
+| `--min-age-s` (180 s) | a marker that just landed may still be finishing |
 | `--max-age-s` (6 h) | no resurrecting week-old dead sessions |
 | `--max` (2) restarts per run | recovery must not become the load spike it recovers from |
 | the verdict must say `free` | refuses to add load when the engine is busy **or unreadable** (`--no-require-free` to override) |
@@ -232,10 +338,26 @@ message, tool calls and results are already in the transcript, so re-sending the
 prompt would ask for the same work twice. The nudge says to pick up where it
 stopped and not redo completed steps.
 
+**Every run reports what it looked at.** A recovery that silently finds nothing is
+indistinguishable from a recovery that is broken — which is exactly how this script
+spent weeks matching zero sessions while three were sitting dead in the database.
+Each tick prints a census and appends it to `recover.jsonl`:
+
+```
+recover-interrupted: census 362 session(s) [answered=332 failed_turn=3 mid_flight=2
+  unanswered_user=25] leases_live=1 markers_24h=3
+  skip   …0c101a9d3455e14312    local     24562min  Audit plan_lan.dot [failed_turn] too old (409.4h)
+```
+
+`markers_24h` with zero picks means the markers are being written and something
+else is answering them; `markers_24h: 0` means the marker pipeline itself is the
+problem. Either way the next person does not have to guess.
+
 Its own state lives under the profile home, in `plugin-data/gpu-gate/`:
-`restarts.json` (the attempt ledger), `restarts.jsonl` (one line per restart) and
-`recover.lock`. The state database is only ever opened read-only. `--dry-run`
-prints what would be restarted, `--help` lists every knob.
+`restarts.json` (the attempt ledger), `restarts.jsonl` (one line per restart),
+`recover.jsonl` (one census line per run) and `recover.lock`. The state database
+is only ever opened read-only. `--dry-run` prints what would be restarted,
+`--help` lists every knob.
 
 ## Decision journal
 
@@ -270,9 +392,11 @@ its tail.
 ## Tests
 
 ```bash
-python3 test_gate.py         # 32 assertions: pure core logic
-python3 test_middleware.py   # 59 assertions: Hermes glue, fake verdict service on a local socket
-python3 test_recover.py      # 38 assertions: interrupted-turn recovery on a throwaway state.db
+python3 test_gate.py         #  32 assertions: pure core logic
+python3 test_middleware.py   # 104 assertions: Hermes glue, fake verdict service on a local socket
+python3 test_pause.py        #  42 assertions: pause scopes, durations, expiry, jitter
+python3 test_perf.py         #  44 assertions: sampling, the slow rule, the streak, the cap
+python3 test_recover.py      #  41 assertions: interrupted-turn recovery on a throwaway state.db
 ```
 
 Fully offline, no network, no GPU: the `admit()` matrix (three modes, turn entry
@@ -280,9 +404,17 @@ vs iteration, unreachable gate, unreachable engine), the wait loop on a fake
 clock (slot after N slices, budget exhausted, exploding probe), `base_url`
 filtering, tag lifecycle (TTL, per-session isolation, removal), priority
 resolution (tag > cwd > platform > unattended > default), settings parsing, the
-journal round-trip and rotation, and — for the recovery cron — candidate
-selection (answered / archived / leased / too young / too old), the per-run cap,
-the per-session attempt breaker and the verdict throttle.
+journal round-trip and rotation. For the pause layer: duration parsing (`30m`,
+`until 15:30`, `indef`, garbage), scope precedence (session > mode > `all`),
+expiry, the indefinite safety net, the jitter window, and the middleware actually
+holding a turn then releasing it on `resume`. For the perf layer: that
+`decode_tps` excludes time-to-first-token, that a short answer or a small prompt
+is never judged, the streak needing `perf_consecutive` in a row, the per-hour cap
+turning into `throttled` instead of escalating, and the auto-pause being **off**
+by default. For the recovery cron: every shape a session can end on (sentinel,
+watchdog `failed_turn`, marker buried under a compaction row, answered, bare
+prompt, tool row, archived, leased, too young, too old), the census counts, the
+per-run cap, the per-session attempt breaker and the verdict throttle.
 
 ## Assumed limits
 
@@ -295,7 +427,25 @@ the per-session attempt breaker and the verdict throttle.
 - **Auxiliary calls are not gated** (titling, compression, vision): they do not go
   through `llm_execution`. Small calls, deliberately out of scope.
 - **A waiting turn is an inactive turn.** The inactivity watchdog does not
-  distinguish "working" from "waiting"; hence the budgets.
+  distinguish "working" from "waiting"; hence the budgets. A plugin cannot stamp
+  the activity clock — `llm_execution` is handed request data, not the agent —
+  so a long wait *will* be aborted at `agent.turn_liveness.timeout_s` if you let
+  it run that long. Keep `max_wait_s`, `max_wait_unattended_s` and
+  `pause_max_wait_s` under it.
+- **A pause holds at the next provider call, not inside the current one.** It
+  cannot reach into a request already in flight, and a timed pause stops holding a
+  turn after `pause_max_wait_s` — a pause that outlives its budget lets the turn
+  through and waits for the next one rather than being killed by a watchdog.
+- **`perf` can only measure what the provider reports.** No `usage` in the
+  response means no sample at all; no `cached_tokens` means `cache_ratio` is
+  `null` and the cache rule simply does not judge that call. Non-streaming calls
+  have no time-to-first-token, so their `decode_tps` includes prefill and is
+  marked `approx`.
+- **Recovery resumes a session in a second process.** `hermes chat --resume` on a
+  session that is *also* open in the desktop means two processes on one
+  transcript; the turn lease blocks most of that, but a session whose lease
+  lapsed while you were reading it can be nudged under you. `--min-age-s` is the
+  blunt instrument keeping that rare.
 - A tag is **per profile**: Hermes profiles are islands on purpose.
 
 ## License

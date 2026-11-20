@@ -284,6 +284,68 @@ straight from the server's metrics, and those are journalled next to the client
 samples. When the two disagree, the client is right about what *it* experienced
 and the engine is right about *why*.
 
+## Warm or cold: is this session's context already resident?
+
+A cold call pays prefill for the whole prompt; a warm one pays almost nothing. On
+this engine (Halogen / llama.cpp, 4 slots, 262 144 ctx) a 30 k-token prompt costs
+~23 s cold and ~0.5 s warm — a 40× difference, and the cold one *evicts* someone
+else's entry to make room. So the useful question before a turn is not "is the GPU
+free" but "does this session still have its context on the card".
+
+**The engine cannot answer it.** There is no API to ask whether a given prefix is
+resident: `/cache` publishes only aggregates (`entries 24/24`, `hit_rate`,
+`evicted`), `/slots` shows slots, not keys. What the engine *does* give you is the
+answer after the fact, in the response you already have:
+
+| call | `usage.prompt_tokens_details` | engine counters |
+|---|---|---|
+| cold | **key absent entirely** | `misses +1`, `evicted +2` |
+| warm | `cached_tokens: 1379` (100 %) | `hits +1`, `evicted +0` |
+
+So warmth is *inferred*, and the inference needs one number per call that only the
+caller has. That is the whole design:
+
+1. **gpu-gate** reads `cached_tokens` / `prompt_tokens` off every call it already
+   samples, and POSTs them to the arbiter (`POST /warmth`, fire-and-forget on a
+   daemon thread — a dead arbiter costs a dropped report, never a stalled turn).
+2. **ia-free** is the arbiter because it is the one place that sees all 2-3 Hermes
+   instances. They never talk to each other; they all talk to the gate.
+3. The gate answers `warmth` on `/free?session=<id>&tokens=<n>`.
+
+The verdict is `hot` only when three things hold at once: the last call's ratio was
+above `warm_ratio_min`, it was less than `warm_grace_s` ago, **and** the engine's
+global `cache_evicted_total` has not moved since. That third term is what makes it
+correct across instances — nothing tells session A that instance B just prefilled
+40 k tokens, but both read the same eviction counter.
+
+```
+/gpu-prio perf
+warmth: hot · age 12s · cache 99% · 28500 tok · evictable 45000 tok · needs 28500 · room: yes · → go
+warmth: unknown · age ? · cache ? · ? tok · evictable 45000 tok · needs 40000 · room: yes · → cold-room
+warmth: evicted · age 5s · cache 90% · 30000 tok · +3 evicted since · needs 40000 · room: no · → cold-no-room
+```
+
+`evictable` answers "is there anything cold enough to throw away": the footprint of
+sessions last seen more than `protect_age_s` ago. Anything younger is counted as
+`protected` — a running session's context is not spare room, and evicting it is how
+you turn one slow session into two. A warm session needs nothing: its space is
+already taken, so it gets `room: yes` unconditionally.
+
+`advice` is the raw "do we go or not" answer — `go`, `cold-room`, `cold-no-room`,
+`cold`. **It is advisory: `/free` does not consult it yet.** Nothing here changes an
+admission decision; the table has to prove itself against real traffic first. The
+knobs live on the arbiter (`IA_FREE_WARM_GRACE_S=90`, `IA_FREE_WARM_RATIO_MIN=0.5`,
+`IA_FREE_PROTECT_AGE_S=60`, `IA_FREE_WARM_TTL_S=900`, `IA_FREE_WARM_MAX_SESSIONS=200`)
+and the table is persisted in `state.json`, so a gate restart does not erase what
+the instances reported.
+
+Two honest limits. The grace window is a guess: a session idle 2 minutes is probably
+gone from a 24-entry cache, but "probably" is all the evidence supports. And the
+engine's cache is 24 entries against a pool that is already 99.6 % full — with more
+than 24 live sessions across all instances, entries leave no matter how careful the
+admission is, and warmth becomes a description of the thrash rather than a way to
+avoid it.
+
 ## Recovering interrupted turns
 
 A gated session spends most of its life *inside* the middleware, waiting. From the
@@ -397,6 +459,7 @@ python3 test_middleware.py   # 104 assertions: Hermes glue, fake verdict service
 python3 test_pause.py        #  42 assertions: pause scopes, durations, expiry, jitter
 python3 test_perf.py         #  44 assertions: sampling, the slow rule, the streak, the cap
 python3 test_recover.py      #  41 assertions: interrupted-turn recovery on a throwaway state.db
+python3 test_warmth.py       #  44 assertions: cache-warmth report out, verdict back
 ```
 
 Fully offline, no network, no GPU: the `admit()` matrix (three modes, turn entry

@@ -1,6 +1,6 @@
 name: gpu-gate
-version: 1.2.0
-description: "Only runs a low-priority session when the inference server is actually free (ia-free /free verdict): low = at most 1 request in flight, ultralow = engine quiet for N seconds at turn entry. Bounded wait, then it proceeds anyway. Also pauses/resumes a session, a mode or everything, and journals per-call decode speed and prompt-cache ratio."
+version: 1.3.0
+description: "Only runs a low-priority session when the inference server is actually free (ia-free /free verdict): low = at most 1 request in flight, ultralow = engine quiet for N seconds at turn entry. Bounded wait, then it proceeds anyway. Also pauses/resumes a session, a mode or everything, journals per-call decode speed and prompt-cache ratio, and reports each call's cache hit to the arbiter so it can tell a warm session from a cold one."
 author: "Nicolas BOUGUES"
 license: MIT
 homepage: "https://github.com/nbougues/hermes-gpu-gate"

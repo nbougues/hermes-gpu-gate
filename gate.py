@@ -127,6 +127,12 @@ def fetch_verdict(url: str, timeout: float = 2.0) -> dict:
         "prefill_tps": signals.get("prefill_tps"),
         "engine_cache_ratio": signals.get("cache_hit_ratio"),
         "queue_wait_s": signals.get("queue_wait_longest_seconds"),
+        # global eviction counter of the engine's prefix cache. Every Hermes instance
+        # reads the same number, which is what makes it the only cross-instance signal
+        # available: none of them can see the others' sessions.
+        "cache_evicted_total": signals.get("cache_evicted_total"),
+        # what the arbiter deduces about *this* session's context (needs `?session=`)
+        "warmth": raw.get("warmth") if isinstance(raw.get("warmth"), dict) else {},
     }
 
 

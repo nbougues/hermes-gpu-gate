@@ -53,6 +53,8 @@ def note_engine(session: str, verdict: dict) -> None:
             "decode_tps": verdict.get("decode_tps"),
             "engine_cache_ratio": verdict.get("engine_cache_ratio"),
             "queue_wait_s": verdict.get("queue_wait_s"),
+            "cache_evicted_total": verdict.get("cache_evicted_total"),
+            "warmth": verdict.get("warmth") or {},
         }))
 
 

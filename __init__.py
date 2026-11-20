@@ -24,7 +24,7 @@ import os
 import time
 from typing import Any, Callable, Optional
 
-from . import gate, pause, perf
+from . import gate, pause, perf, warmth
 
 logger = logging.getLogger("plugins.gpu_gate")
 
@@ -376,6 +376,12 @@ def make_perf_hook(settings: Settings, state: Any,
         row["engine"] = perf.engine_note(session_id)
         data_dir = getattr(state, "data_dir", None)
         gate.journal_write(data_dir, row, policy.perf_max_bytes, name=perf.JOURNAL_NAME)
+        # Ship what only this call knows — how much of *our* prompt the engine found
+        # already resident — to the arbiter, which is the only place that sees every
+        # Hermes instance. Fire-and-forget: the reply is for the next time we ask.
+        body = warmth.payload(row, (row["engine"] or {}).get("cache_evicted_total"))
+        if body:
+            warmth.spawn(warmth.endpoint(policy.url), body, policy.timeout_s)
         decision = tracker.observe(row)
         if not decision:
             return None
@@ -496,7 +502,8 @@ def do_pauses(state: Any) -> str:
                             row["source"]) for row in rows)
 
 
-def do_perf(state: Any, policy: gate.Policy, limit: int = 12, needle: str = "") -> str:
+def do_perf(state: Any, policy: gate.Policy, limit: int = 12, needle: str = "",
+            session_id: str = "") -> str:
     rows = gate.journal_read(getattr(state, "data_dir", None), 400, needle,
                              name=perf.JOURNAL_NAME)
     calls = [row for row in rows if "decode_tps" in row or "output_tokens" in row]
@@ -508,6 +515,8 @@ def do_perf(state: Any, policy: gate.Policy, limit: int = 12, needle: str = "") 
                 "ARMED %.0f-%.0fs" % (policy.auto_pause_min_s, policy.auto_pause_max_s)
                 if policy.auto_pause_enabled else "off"),
              block]
+    view = warmth.last(session_id) or (perf.engine_note(session_id) or {}).get("warmth") or {}
+    lines.append(warmth.fmt_view(view))
     if rows:
         lines.append("recent:")
         for row in rows[:limit]:
@@ -552,7 +561,7 @@ def make_slash(ctx: Any, settings: Settings, cache: gate.VerdictCache, state: An
             limit = 12
             if (rest or "").isdigit():
                 limit = max(1, int(rest))
-            return do_perf(state, policy, limit)
+            return do_perf(state, policy, limit, "", session_id)
         if verb == "status":
             v = cache.get(force=True)
             mode, origin = resolve_mode(ctx, state, session_id, "", policy)

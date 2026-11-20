@@ -34,8 +34,32 @@ The gate adds that notion, inside the agent process, in code, not in a prompt.
 | Mode | Turn entry (first iteration) | Later iterations |
 |---|---|---|
 | `normal` | nothing | nothing |
-| `low` | `free`: at most `max_inflight` (1) request in flight | `free` |
+| `low` | `free`: at most `max_inflight` requests in flight **and** room left in the KV pool | `free` |
 | `ultralow` | `idle_ok`: engine quiet for `idle_min_s` (30 s) | `free` |
+
+### What `free` actually means
+
+The gate only asks the arbiter (`/free`) whether it may proceed; the arbiter
+decides. Two independent conditions must hold:
+
+1. **Queue depth** — `inflight <= max_inflight`. This is *not* a capacity limit
+   any more: an engine with 4 slots serving joint rounds is meant to run several
+   requests at once, so a limit of 1 here only adds latency.
+2. **KV headroom** — `kv_free_positions >= kv_reserve_positions`, i.e. there is
+   room for one more full context in the pool without evicting a resident one.
+
+Condition 2 is the one that matters, and it is what the earlier `max_inflight: 1`
+rule was clumsily approximating. Measured on a 786 432-position pool with five
+148 k-token sessions: **0 % cache retention, every turn paying a full re-prefill
+(88 s median, 170 s worst) to emit 96 tokens**. After doubling the pool:
+**100 % retention, 0.37 s median**. An eviction is not "a bit slower", it is a
+complete GPU re-read of the context — so the admission question is never "how
+many requests are running" but "is there room for this context".
+
+The arbiter cannot know the size of the request that has not arrived yet, so it
+reserves one typical context (`kv_reserve_positions`) and refuses below that.
+It fails open when the engine publishes no counters: an arbiter that cannot
+measure has no business blocking work.
 
 If the slot is not open, **we wait**, in `poll_slice_s` slices, up to
 `max_wait_s`. **At the end of the budget we proceed anyway.** A task that waits

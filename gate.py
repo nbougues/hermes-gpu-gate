@@ -3,8 +3,10 @@
 Three priority modes:
 
   normal    no waiting, nothing changes
-  low       passes as soon as the engine still accepts a request (`free`:
-            at most `max_inflight` requests in flight)
+  low       passes as soon as the arbiter says `free` — which means both
+            `inflight <= max_inflight` (queue depth) and enough free
+            positions in the KV pool for one more context (capacity).
+            The gate does not compute either: it asks and obeys.
   ultralow  additionally requires the engine to have been quiet for
             `idle_min_s` (`idle_ok`) at turn entry, then settles for `free`
             on the following iterations

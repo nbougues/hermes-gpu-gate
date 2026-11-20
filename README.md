@@ -340,11 +340,21 @@ and the table is persisted in `state.json`, so a gate restart does not erase wha
 the instances reported.
 
 Two honest limits. The grace window is a guess: a session idle 2 minutes is probably
-gone from a 24-entry cache, but "probably" is all the evidence supports. And the
-engine's cache is 24 entries against a pool that is already 99.6 % full — with more
-than 24 live sessions across all instances, entries leave no matter how careful the
-admission is, and warmth becomes a description of the thrash rather than a way to
-avoid it.
+gone from a two-dozen-entry cache, but "probably" is all the evidence supports. And
+the engine's cache holds only a couple of dozen entries (`max_entries` 24 on 0.18.15,
+28 on 0.20.7) against a pool that was already 99.6 % full — with more live sessions
+than that across all instances, entries leave no matter how careful the admission is,
+and warmth becomes a description of the thrash rather than a way to avoid it.
+
+One trap worth naming, because an engine upgrade walked straight into it: every
+counter used here is monotonic *per engine generation*. A restart resets them, and a
+decremented eviction counter reads as "nobody evicted anything" — so a session that
+was warm right before the restart stays warm forever. The arbiter therefore keeps an
+`engine_epoch`, bumped when `requests_total` goes backwards or when any session's
+reported eviction counter is above the engine's current one (the baseline-free case:
+arbiter restarted *after* the engine). A bump wipes the warmth table. Nothing survives
+a restart, and pretending otherwise is how a cold session gets told it has nothing to
+reload.
 
 ## Recovering interrupted turns
 
